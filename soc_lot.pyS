@@ -1,0 +1,597 @@
+"""SoC → Lines-of-Therapy (LOT) scoring pipeline.
+
+Reads country-level Standard-of-Care (SoC) PDFs from GCS (one subfolder per
+country under ``GCS_SOC_BASE_PATH``), looks up each drug's Mechanism of
+Action (MOA) from BigQuery, asks Gemini to (1) extract a per-country SoC LOT
+benchmark and (2) classify each supplied drug against that benchmark, then
+writes a single Excel workbook with one row per drug/country combination:
+
+    drug_name, country, lot_score, lot_type, rationale, confidence, final_lot_score
+
+Place this module at ``medical_potential/soc_lot_scoring.py`` so it can reuse
+``medical_potential.gcp_utils`` and ``medical_potential.config`` exactly like
+the rest of the package.
+
+NEW CONFIG REQUIRED
+--------------------
+Add the following to ``medical_potential/config.py`` (they do not exist yet):
+
+    BQ_BRANDS_TABLE       # e.g. "brands"  — table with Cleaned_Generic_Name /
+                          #   Mechanism_of_Action / Mechanism_of_Action_Detailed
+    GCS_SOC_BASE_PATH     # e.g. "SOC"     — GCS prefix under GCS_BUCKET that
+                          #   contains one subfolder per country, each holding
+                          #   that country's SoC PDF(s)
+
+GEMINI_API_KEY is loaded from the environment (.env), matching the existing
+scripts (U2.py / lot.py) rather than from config.py.
+"""
+
+from __future__ import annotations
+
+import io
+import logging
+import os
+import re
+import sys
+from dataclasses import dataclass, field
+
+import fitz  # PyMuPDF
+import pandas as pd
+from dotenv import load_dotenv
+from google import genai
+from google.genai import types
+
+from medical_potential.config import (
+    BQ_BRANDS_TABLE,
+    BQ_DATASET_ID,
+    GCS_BUCKET,
+    GCS_REPORT_BASE_PATH,
+    GCS_SOC_BASE_PATH,
+    PROJECT_ID,
+)
+from medical_potential.gcp_utils import get_bq_client, get_gcs_client
+
+logger = logging.getLogger(__name__)
+
+# ==============================
+# ENV / GEMINI CLIENT
+# ==============================
+load_dotenv()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+if not GEMINI_API_KEY:
+    raise ValueError("❌ GEMINI_API_KEY not found.")
+client = genai.Client(api_key=GEMINI_API_KEY)
+
+# ==============================
+# CONFIG / CONSTANTS
+# ==============================
+MODEL_NAME = "gemini-2.5-flash"
+OUTPUT_FOLDER = "output"
+
+# LOT type -> numeric score
+LOT_SCORE_MAP: dict[str, int] = {
+    "first-line standard of care": 5,
+    "strong first-line alternative / dominant second-line": 4,
+    "second-line option": 3,
+    "third-line or restricted niche use": 2,
+    "salvage / last-resort use": 1,
+}
+
+# Fallback keyword matching, checked in order, for LOT strings that don't
+# exactly match LOT_SCORE_MAP (e.g. minor wording drift from the LLM).
+LOT_KEYWORD_FALLBACK: list[tuple[str, int]] = [
+    ("salvage", 1),
+    ("last-resort", 1),
+    ("third-line", 2),
+    ("restricted niche", 2),
+    ("strong first-line alternative", 4),
+    ("dominant second-line", 4),
+    ("second-line", 3),
+    ("first-line", 5),
+]
+
+# Country weighting for final_lot_score
+US_WEIGHT = 0.58
+OTHER_COUNTRY_WEIGHT = 0.14
+US_ALIASES = {"us", "usa", "u.s.", "u.s.a.", "united states", "united_states", "united states of america"}
+
+
+# ==============================
+# CLI ARGUMENTS
+# ==============================
+def parse_drugs() -> list[str]:
+    """Reads drug names from CLI args, falling back to an interactive prompt."""
+    if len(sys.argv) > 1:
+        drugs = sys.argv[1:]
+    else:
+        user_input = input("No drugs supplied. Enter drug names separated by spaces: ").strip()
+        if not user_input:
+            raise SystemExit("❌ No drug names provided. Exiting.")
+        drugs = user_input.split()
+    print(f"💊 Drugs to analyse: {', '.join(drugs)}")
+    return drugs
+
+
+# ==============================
+# BIGQUERY: MOA LOOKUP
+# ==============================
+def lookup_moa(drug_names: list[str]) -> dict[str, dict]:
+    """Maps each drug name to its MOA via BigQuery. Falls back to 'Unknown'."""
+    bq_client = get_bq_client()
+    table_ref = f"`{PROJECT_ID}.{BQ_DATASET_ID}.{BQ_BRANDS_TABLE}`"
+
+    placeholders = ", ".join(f"@drug_{i}" for i in range(len(drug_names)))
+    query = f"""
+        SELECT
+            Cleaned_Generic_Name,
+            Mechanism_of_Action,
+            Mechanism_of_Action_Detailed
+        FROM {table_ref}
+        WHERE LOWER(Cleaned_Generic_Name) IN ({placeholders})
+    """
+    from google.cloud import bigquery  # local import keeps top-level deps minimal
+
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter(f"drug_{i}", "STRING", name.lower())
+            for i, name in enumerate(drug_names)
+        ]
+    )
+    results = bq_client.query(query, job_config=job_config).result()
+
+    moa_map_lower: dict[str, dict] = {}
+    for row in results:
+        moa_map_lower[row.Cleaned_Generic_Name.lower()] = {
+            "moa": row.Mechanism_of_Action or "Unknown",
+            "moa_detailed": row.Mechanism_of_Action_Detailed or "",
+        }
+
+    drug_moa: dict[str, dict] = {}
+    for drug in drug_names:
+        match = moa_map_lower.get(drug.lower())
+        if match:
+            drug_moa[drug] = match
+        else:
+            print(f"⚠️  '{drug}' not found in BigQuery table. Using 'Unknown' as MOA.")
+            drug_moa[drug] = {"moa": "Unknown", "moa_detailed": ""}
+
+    return drug_moa
+
+
+# ==============================
+# GCS: DISCOVER + READ SoC PDFs
+# ==============================
+def discover_countries_gcs(base_path: str = GCS_SOC_BASE_PATH) -> dict[str, list[str]]:
+    """Lists SoC PDFs in GCS, grouped by country.
+
+    Expects blobs laid out as: {base_path}/{Country}/{...}.pdf
+    Returns {country_name: [blob_name, ...]}.
+    """
+    gcs_client = get_gcs_client()
+    bucket = gcs_client.bucket(GCS_BUCKET)
+    prefix = f"{base_path.rstrip('/')}/"
+
+    countries: dict[str, list[str]] = {}
+    for blob in gcs_client.list_blobs(bucket, prefix=prefix):
+        if not blob.name.lower().endswith(".pdf"):
+            continue
+        relative = blob.name[len(prefix):]
+        parts = relative.split("/")
+        if len(parts) < 2:
+            # No country subfolder — skip stray files directly under base_path
+            continue
+        country = parts[0]
+        countries.setdefault(country, []).append(blob.name)
+
+    if not countries:
+        raise FileNotFoundError(f"❌ No country PDFs found under gs://{GCS_BUCKET}/{prefix}")
+
+    for country in countries:
+        countries[country].sort()
+
+    return countries
+
+
+def extract_pdf_text_from_bytes(pdf_bytes: bytes) -> str:
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    try:
+        return "".join(page.get_text("text") for page in doc)
+    finally:
+        doc.close()
+
+
+def extract_country_pdfs_text_gcs(blob_names: list[str]) -> str:
+    """Downloads and concatenates text from all PDFs for a single country."""
+    gcs_client = get_gcs_client()
+    bucket = gcs_client.bucket(GCS_BUCKET)
+
+    sections = []
+    for i, blob_name in enumerate(blob_names, 1):
+        blob = bucket.blob(blob_name)
+        pdf_bytes = blob.download_as_bytes()
+        text = extract_pdf_text_from_bytes(pdf_bytes)
+        filename = blob_name.rsplit("/", 1)[-1]
+        sections.append(f"--- Document {i}: {filename} ---\n{text}")
+    return "\n\n".join(sections)
+
+
+# ==============================
+# SYSTEM INSTRUCTION (SoC extraction)
+# ==============================
+SYSTEM_INSTRUCTION = """You are a Clinical Pharmacist and Diabetes/Obesity Treatment Pathway Analyst.
+Analyze the provided Standard of Care (SoC) document(s) and create a country-level Lines of Therapy (LOT) benchmark.
+
+LANGUAGE HANDLING:
+- The source documents may be in English, French, or a mix of languages.
+- Regardless of the source language, ALL output must be in English.
+- Translate any non-English clinical terms, drug names, and therapy descriptions into their standard English equivalents.
+
+PURPOSE:
+Neutral, evidence-based extraction for downstream LOT comparison.
+
+SCOPE:
+- Type 2 Diabetes Mellitus (T2DM)
+- Obesity / Weight Management
+
+NOTE:
+- You may receive text extracted from multiple SoC PDFs for the same country.
+- Synthesise all documents into a single unified LOT benchmark for that country.
+- If documents conflict, prefer the most recent or most authoritative guidance.
+
+OUTPUT FORMAT STRICT:
+Country: [Country]
+Country-Level SoC LOT Benchmark
+
+1L:
+Recommended therapies/interventions:
+Patient segment or trigger:
+Treatment goal or rationale:
+
+2L:
+Recommended therapies/interventions:
+Patient segment or trigger:
+Treatment goal or rationale:
+
+3L:
+Recommended therapies/interventions:
+Patient segment or trigger:
+Treatment goal or rationale:
+
+Salvage:
+Recommended therapies/interventions:
+Patient segment or trigger:
+Treatment goal or rationale:
+
+Therapy Classes Explicitly Mentioned:
+- List all major classes
+
+FORMATTING RULES:
+- Output plain business English.
+- Do NOT use markdown.
+- Do NOT use LaTeX.
+- Use Unicode symbols directly: ≥ ≤ kg/m2.
+- Do NOT use *, **, #, or $.
+- Produce plain text."""
+
+
+# ==============================
+# OVERLAY PROMPT (LOT classification + confidence)
+# ==============================
+def build_overlay_prompt(drugs: list[str], drug_moa: dict[str, dict]) -> str:
+    molecule_lines = []
+    for i, drug in enumerate(drugs):
+        moa = drug_moa[drug]["moa"]
+        moa_det = drug_moa[drug]["moa_detailed"]
+        detail = f" ({moa_det})" if moa_det else ""
+        molecule_lines.append(f"{i + 1}. {drug} - MOA: {moa}{detail}")
+    molecule_list = "\n".join(molecule_lines)
+
+    output_blocks = "\n\n".join(
+        f"{drug}:\nMolecule: {drug}\nMOA: {drug_moa[drug]['moa']}\n"
+        f"Final LoT Category:\nRationale:\nConfidence:"
+        for drug in drugs
+    )
+
+    return f"""You are a Senior Market Access Analyst.
+
+Task:
+Determine the most appropriate Line of Treatment (LOT) classification for each molecule below based ONLY on the supplied MOA and the SoC definitions provided above.
+
+Molecules and their MOA:
+{molecule_list}
+
+LOT ASSIGNMENT RULES:
+- Identify the pharmacologic class, therapeutic modality, or treatment approach from the MOA.
+- Match the MOA to the therapy classes, mechanisms, modalities, or treatment approaches explicitly described in the SoC.
+- Determine the earliest treatment line in which the matching therapy class, mechanism, modality, or treatment approach appears.
+- If the MOA aligns with multiple treatment lines, assign the earliest applicable line.
+- Do NOT use historical treatment sequencing, current prescribing patterns, external guidelines, prior knowledge, or assumptions outside the supplied SoC.
+- Evaluate the MOA against all SoC pathways and patient segments described in the benchmark.
+- When a therapy class, mechanism, modality, or treatment approach appears in multiple SoC pathways, prioritize the earliest treatment line in which it is explicitly recommended.
+- Only assign Second-Line when the MOA aligns primarily with therapies described as add-on, substitute, escalation, replacement, or post-failure options relative to First-Line treatment.
+- Only assign Third-Line when the MOA aligns primarily with therapies described as later-line escalation, refractory-disease management, restricted-use therapies, or options used after failure of earlier treatment lines.
+- Only assign Salvage when the MOA aligns primarily with rescue therapies, transplantation, last-resort interventions, or therapies explicitly described in the Salvage section of the SoC.
+- When uncertainty exists, assign the earliest treatment line supported by the MOA-to-SoC mapping.
+
+CLASSIFICATION OPTIONS (use this exact wording for Final LoT Category):
+- First-line standard of care
+- Strong first-line alternative / dominant second-line
+- Second-line option
+- Third-line or restricted niche use
+- Salvage / last-resort use
+
+CONFIDENCE:
+- For each molecule, also output a Confidence score from 0 to 100 reflecting how directly the MOA maps to explicit language in the SoC.
+- Use a high confidence (80-100) only when the SoC explicitly names the therapy class/mechanism at a specific line.
+- Use a medium confidence (50-79) when the mapping is inferred from a closely related class or modality.
+- Use a low confidence (0-49) when the SoC does not clearly address this MOA and the line was inferred indirectly.
+- Output Confidence as a bare integer (e.g. "82"), with no % sign or extra words.
+
+OUTPUT FORMAT (repeat exactly for every molecule, keep field labels verbatim):
+{output_blocks}
+
+FORMATTING RULES:
+- Output plain business English.
+- Do NOT use markdown.
+- Do NOT use LaTeX.
+- Use Unicode symbols directly.
+- Produce plain text."""
+
+
+# ==============================
+# TEXT CLEANUP
+# ==============================
+def clean_text(text: str) -> str:
+    replacements = {
+        "$\\ge$": "≥",
+        "$\\le$": "≤",
+        "\\ge": "≥",
+        "\\le": "≤",
+        "**": "",
+        "*": "",
+        "#": "",
+    }
+    for old, new in replacements.items():
+        text = text.replace(old, new)
+    text = re.sub(r"\$+", "", text)
+    return text.strip()
+
+
+# ==============================
+# GEMINI CALLS
+# ==============================
+def run_soc_extraction(pdf_text: str, country: str) -> str:
+    response = client.models.generate_content(
+        model=MODEL_NAME,
+        contents=(f"Country: {country}\n\nBelow are the full SoC document(s) for {country}:\n\n{pdf_text}"),
+        config=types.GenerateContentConfig(system_instruction=SYSTEM_INSTRUCTION, temperature=0.1),
+    )
+    return response.text if response.text else "No response received."
+
+
+def run_overlay_analysis(soc_text: str, overlay_prompt: str) -> str:
+    response = client.models.generate_content(
+        model=MODEL_NAME,
+        contents=(
+            "Below is the extracted SoC benchmark. "
+            "Use it as the sole reference for LOT assignment.\n\n"
+            f"{soc_text}\n\n{overlay_prompt}"
+        ),
+        config=types.GenerateContentConfig(temperature=0.1),
+    )
+    return response.text if response.text else "No response received."
+
+
+# ==============================
+# PARSE OVERLAY OUTPUT -> STRUCTURED FIELDS
+# ==============================
+def split_drug_blocks(text: str, drugs: list[str]) -> dict[str, str]:
+    """Splits the overlay LLM output into one text block per drug heading."""
+    positions: list[tuple[int, str]] = []
+    for drug in drugs:
+        pattern = re.compile(rf"(?im)^{re.escape(drug)}\s*:\s*$")
+        m = pattern.search(text)
+        if m:
+            positions.append((m.start(), drug))
+
+    positions.sort(key=lambda p: p[0])
+    blocks: dict[str, str] = {}
+    for i, (start, drug) in enumerate(positions):
+        end = positions[i + 1][0] if i + 1 < len(positions) else len(text)
+        blocks[drug] = text[start:end]
+    return blocks
+
+
+def extract_field(block: str, label: str) -> str:
+    pattern = re.compile(
+        rf"(?im)^{re.escape(label)}\s*:\s*(.*?)(?=\n[A-Za-z][A-Za-z /\\-]*:\s*|\Z)",
+        re.DOTALL,
+    )
+    m = pattern.search(block)
+    return clean_text(m.group(1)) if m else ""
+
+
+def parse_overlay_output(overlay_text: str, drugs: list[str]) -> dict[str, dict]:
+    """Returns {drug: {"lot_type": ..., "rationale": ..., "confidence": int|None}}."""
+    blocks = split_drug_blocks(overlay_text, drugs)
+    parsed: dict[str, dict] = {}
+    for drug in drugs:
+        block = blocks.get(drug, "")
+        if not block:
+            logger.warning("[SOC_LOT] Could not locate output block for drug '%s'", drug)
+        lot_type = extract_field(block, "Final LoT Category")
+        rationale = extract_field(block, "Rationale")
+        confidence_raw = extract_field(block, "Confidence")
+
+        confidence: int | None = None
+        conf_match = re.search(r"\d{1,3}", confidence_raw)
+        if conf_match:
+            confidence = max(0, min(100, int(conf_match.group(0))))
+
+        parsed[drug] = {"lot_type": lot_type, "rationale": rationale, "confidence": confidence}
+    return parsed
+
+
+# ==============================
+# LOT SCORE MAPPING
+# ==============================
+def map_lot_type_to_score(lot_type: str) -> int | None:
+    if not lot_type:
+        return None
+    normalized = lot_type.strip().lower()
+    if normalized in LOT_SCORE_MAP:
+        return LOT_SCORE_MAP[normalized]
+    for keyword, score in LOT_KEYWORD_FALLBACK:
+        if keyword in normalized:
+            return score
+    logger.warning("[SOC_LOT] Unrecognized LOT type '%s' — no score assigned", lot_type)
+    return None
+
+
+def country_weight(country: str) -> float:
+    normalized = re.sub(r"[_\-]+", " ", country).strip().lower()
+    return US_WEIGHT if normalized in US_ALIASES else OTHER_COUNTRY_WEIGHT
+
+
+def compute_final_lot_score(lot_score: int | None, country: str) -> float | None:
+    if lot_score is None:
+        return None
+    return round(lot_score * country_weight(country), 4)
+
+
+# ==============================
+# PER-COUNTRY PROCESSING
+# ==============================
+@dataclass
+class LotRow:
+    drug_name: str
+    country: str
+    lot_score: int | None
+    lot_type: str
+    rationale: str
+    confidence: int | None
+    final_lot_score: float | None
+
+
+def process_country(country: str, blob_names: list[str], drugs: list[str], overlay_prompt: str) -> list[LotRow]:
+    n_pdfs = len(blob_names)
+    print(f"\n{'=' * 50}")
+    print(f"🌍 Processing: {country}  ({n_pdfs} PDF{'s' if n_pdfs > 1 else ''})")
+    print(f"{'=' * 50}")
+
+    print(f"   📄 Reading {n_pdfs} PDF(s) from GCS...")
+    pdf_text = extract_country_pdfs_text_gcs(blob_names)
+
+    print(f"   🧠 Extracting SoC for {country}...")
+    soc_output = run_soc_extraction(pdf_text, country)
+
+    print(f"   ⚡ Running overlay analysis for {country}...")
+    overlay_output = run_overlay_analysis(soc_output, overlay_prompt)
+
+    print("   🔎 Parsing structured LOT results...")
+    parsed = parse_overlay_output(overlay_output, drugs)
+
+    rows: list[LotRow] = []
+    for drug in drugs:
+        info = parsed.get(drug, {"lot_type": "", "rationale": "", "confidence": None})
+        lot_score = map_lot_type_to_score(info["lot_type"])
+        rows.append(
+            LotRow(
+                drug_name=drug,
+                country=country,
+                lot_score=lot_score,
+                lot_type=info["lot_type"],
+                rationale=info["rationale"],
+                confidence=info["confidence"],
+                final_lot_score=compute_final_lot_score(lot_score, country),
+            )
+        )
+    return rows
+
+
+# ==============================
+# OUTPUT: EXCEL
+# ==============================
+def save_results_to_excel(rows: list[LotRow], output_path: str) -> None:
+    df = pd.DataFrame(
+        [
+            {
+                "drug_name": r.drug_name,
+                "country": r.country,
+                "lot_score": r.lot_score,
+                "lot_type": r.lot_type,
+                "rationale": r.rationale,
+                "confidence": r.confidence,
+                "final_lot_score": r.final_lot_score,
+            }
+            for r in rows
+        ]
+    )
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    df.to_excel(output_path, index=False, sheet_name="SoC LOT Scores")
+    print(f"✅ Saved: {output_path}")
+
+
+def upload_excel_to_gcs(local_path: str, molecule_slug: str) -> str | None:
+    """Optionally uploads the finished workbook to GCS, reusing GCS_REPORT_BASE_PATH."""
+    try:
+        gcs_client = get_gcs_client()
+        bucket = gcs_client.bucket(GCS_BUCKET)
+        gcs_path = f"{GCS_REPORT_BASE_PATH}/lot_scores/{molecule_slug}/soc_lot_scores.xlsx"
+        blob = bucket.blob(gcs_path)
+        blob.upload_from_filename(
+            local_path,
+            content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+        gcs_uri = f"gs://{GCS_BUCKET}/{gcs_path}"
+        logger.info("[SOC_LOT] Uploaded results workbook to %s", gcs_uri)
+        print(f"☁️  Uploaded to: {gcs_uri}")
+        return gcs_uri
+    except Exception as exc:
+        logger.warning("[SOC_LOT] Failed to upload results workbook to GCS: %s", exc)
+        return None
+
+
+# ==============================
+# MAIN
+# ==============================
+def main() -> None:
+    drugs = parse_drugs()
+
+    print("🔍 Looking up MoA from BigQuery...")
+    drug_moa = lookup_moa(drugs)
+    for drug, info in drug_moa.items():
+        detail = f" ({info['moa_detailed']})" if info["moa_detailed"] else ""
+        print(f"   {drug} → {info['moa']}{detail}")
+
+    overlay_prompt = build_overlay_prompt(drugs, drug_moa)
+
+    print(f"\n📂 Scanning gs://{GCS_BUCKET}/{GCS_SOC_BASE_PATH}...")
+    countries = discover_countries_gcs()
+    print(f"   Found {len(countries)} country folder(s): {', '.join(countries.keys())}")
+
+    all_rows: list[LotRow] = []
+    for country, blob_names in countries.items():
+        try:
+            all_rows.extend(process_country(country, blob_names, drugs, overlay_prompt))
+        except Exception as exc:
+            print(f"   ❌ Failed for {country}: {exc}")
+            logger.exception("[SOC_LOT] Failed processing country '%s'", country)
+
+    slug = "_".join(d.lower() for d in drugs)
+    output_path = os.path.join(OUTPUT_FOLDER, f"soc_lot_scores_{slug}.xlsx")
+    save_results_to_excel(all_rows, output_path)
+
+    if os.getenv("SOC_LOT_UPLOAD_TO_GCS", "").lower() in {"1", "true", "yes"}:
+        upload_excel_to_gcs(output_path, slug)
+
+    print(f"\n{'=' * 50}")
+    print("📊 SUMMARY")
+    print(f"{'=' * 50}")
+    for country in countries:
+        n = sum(1 for r in all_rows if r.country == country)
+        print(f"   ✅ {country}: {n} row(s)")
+
+
+if __name__ == "__main__":
+    main()
