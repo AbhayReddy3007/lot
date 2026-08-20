@@ -2,15 +2,16 @@
 
 Reads country-level Standard-of-Care (SoC) PDFs from GCS (one subfolder per
 country under ``GCS_SOC_BASE_PATH``), looks up each drug's Mechanism of
-Action (MOA) from BigQuery, asks Gemini to (1) extract a per-country SoC LOT
-benchmark and (2) classify each supplied drug against that benchmark, then
-writes a single Excel workbook with one row per drug/country combination:
+Action (MOA) from the BigQuery MOA lookup table, asks Gemini to (1) extract a
+per-country SoC LOT benchmark and (2) classify each supplied drug against
+that benchmark, then pushes one row per drug/country combination to
+BigQuery:
 
     drug_name, country, lot_score, lot_type, rationale, confidence, final_lot_score
 
 final_lot_score is a per-drug aggregate across all countries, NOT a per-row
-value: (US lot_score x 0.58) + 0.14 x sum(lot_score for every other country).
-It is repeated on every row for that drug.
+value: (US lot_score x US_WEIGHT) + OTHER_COUNTRY_WEIGHT x sum(lot_score for
+every other country). It is repeated on every row for that drug.
 
 Place this module at ``medical_potential/soc_lot_scoring.py`` so it can reuse
 ``medical_potential.gcp_utils`` and ``medical_potential.config`` exactly like
@@ -20,11 +21,19 @@ NEW CONFIG REQUIRED
 --------------------
 Add the following to ``medical_potential/config.py`` (they do not exist yet):
 
-    BQ_BRANDS_TABLE       # e.g. "brands"  — table with Cleaned_Generic_Name /
+    MOA_LOOKUP_TABLE      # e.g. "brands"  — BQ table (under PROJECT_ID /
+                          #   BQ_DATASET_ID) with Cleaned_Generic_Name /
                           #   Mechanism_of_Action / Mechanism_of_Action_Detailed
     GCS_SOC_BASE_PATH     # e.g. "SOC"     — GCS prefix under GCS_BUCKET that
                           #   contains one subfolder per country, each holding
                           #   that country's SoC PDF(s)
+    MODEL_NAME            # e.g. "gemini-2.5-flash" — Gemini model used for
+                          #   both SoC extraction and overlay analysis
+    US_WEIGHT             # e.g. 0.58 — weight applied to the US lot_score
+    OTHER_COUNTRY_WEIGHT  # e.g. 0.14 — weight applied to each non-US lot_score
+    LOT_PROJECT_ID        # GCP project that hosts the LOT results table
+    LOT_DATASET_ID        # BQ dataset that hosts the LOT results table
+    LOT_TABLE             # BQ table results are pushed to, e.g. "soc_lot_scores"
 
 GEMINI_API_KEY is loaded from the environment (.env), matching the existing
 scripts (U2.py / lot.py) rather than from config.py.
@@ -32,26 +41,30 @@ scripts (U2.py / lot.py) rather than from config.py.
 
 from __future__ import annotations
 
-import io
 import logging
 import os
 import re
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from datetime import datetime, timezone
 
 import fitz  # PyMuPDF
-import pandas as pd
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 
 from medical_potential.config import (
-    BQ_BRANDS_TABLE,
     BQ_DATASET_ID,
     GCS_BUCKET,
-    GCS_REPORT_BASE_PATH,
     GCS_SOC_BASE_PATH,
+    LOT_DATASET_ID,
+    LOT_PROJECT_ID,
+    LOT_TABLE,
+    MODEL_NAME,
+    MOA_LOOKUP_TABLE,
+    OTHER_COUNTRY_WEIGHT,
     PROJECT_ID,
+    US_WEIGHT,
 )
 from medical_potential.gcp_utils import get_bq_client, get_gcs_client
 
@@ -69,9 +82,6 @@ client = genai.Client(api_key=GEMINI_API_KEY)
 # ==============================
 # CONFIG / CONSTANTS
 # ==============================
-MODEL_NAME = "gemini-2.5-flash"
-OUTPUT_FOLDER = "output"
-
 # LOT type -> numeric score
 LOT_SCORE_MAP: dict[str, int] = {
     "first-line standard of care": 5,
@@ -94,9 +104,6 @@ LOT_KEYWORD_FALLBACK: list[tuple[str, int]] = [
     ("first-line", 5),
 ]
 
-# Country weighting for final_lot_score
-US_WEIGHT = 0.58
-OTHER_COUNTRY_WEIGHT = 0.14
 US_ALIASES = {"us", "usa", "u.s.", "u.s.a.", "united states", "united_states", "united states of america"}
 
 
@@ -122,7 +129,7 @@ def parse_drugs() -> list[str]:
 def lookup_moa(drug_names: list[str]) -> dict[str, dict]:
     """Maps each drug name to its MOA via BigQuery. Falls back to 'Unknown'."""
     bq_client = get_bq_client()
-    table_ref = f"`{PROJECT_ID}.{BQ_DATASET_ID}.{BQ_BRANDS_TABLE}`"
+    table_ref = f"`{PROJECT_ID}.{BQ_DATASET_ID}.{MOA_LOOKUP_TABLE}`"
 
     placeholders = ", ".join(f"@drug_{i}" for i in range(len(drug_names)))
     query = f"""
@@ -529,46 +536,56 @@ def process_country(country: str, blob_names: list[str], drugs: list[str], overl
 
 
 # ==============================
-# OUTPUT: EXCEL
+# OUTPUT: BIGQUERY
 # ==============================
-def save_results_to_excel(rows: list[LotRow], output_path: str) -> None:
-    df = pd.DataFrame(
-        [
-            {
-                "drug_name": r.drug_name,
-                "country": r.country,
-                "lot_score": r.lot_score,
-                "lot_type": r.lot_type,
-                "rationale": r.rationale,
-                "confidence": r.confidence,
-                "final_lot_score": r.final_lot_score,
-            }
-            for r in rows
-        ]
+from google.cloud import bigquery  # noqa: E402  (kept near its single use, mirrors gcp_utils style)
+
+LOT_RESULTS_SCHEMA: list[bigquery.SchemaField] = [
+    bigquery.SchemaField("drug_name", "STRING", mode="NULLABLE"),
+    bigquery.SchemaField("country", "STRING", mode="NULLABLE"),
+    bigquery.SchemaField("lot_score", "INTEGER", mode="NULLABLE"),
+    bigquery.SchemaField("lot_type", "STRING", mode="NULLABLE"),
+    bigquery.SchemaField("rationale", "STRING", mode="NULLABLE"),
+    bigquery.SchemaField("confidence", "INTEGER", mode="NULLABLE"),
+    bigquery.SchemaField("final_lot_score", "FLOAT", mode="NULLABLE"),
+    bigquery.SchemaField("timestamp", "TIMESTAMP", mode="NULLABLE"),
+]
+
+
+def push_results_to_bigquery(rows: list[LotRow]) -> None:
+    """Pushes all LOT result rows to the configured BigQuery table.
+
+    Reuses the ``gcp_utils.get_bq_client`` credential pattern and writes in
+    append mode, creating the table if it does not already exist, matching
+    ``gcp_utils.append_dimension_score_to_bigquery``.
+    """
+    table_id = f"{LOT_PROJECT_ID}.{LOT_DATASET_ID}.{LOT_TABLE}"
+    timestamp = datetime.now(timezone.utc).isoformat()
+
+    payload = [
+        {
+            "drug_name": r.drug_name,
+            "country": r.country,
+            "lot_score": r.lot_score,
+            "lot_type": r.lot_type,
+            "rationale": r.rationale,
+            "confidence": r.confidence,
+            "final_lot_score": r.final_lot_score,
+            "timestamp": timestamp,
+        }
+        for r in rows
+    ]
+
+    bq_client = get_bq_client()
+    job_config = bigquery.LoadJobConfig(
+        schema=LOT_RESULTS_SCHEMA,
+        write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
+        create_disposition=bigquery.CreateDisposition.CREATE_IF_NEEDED,
     )
-    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-    df.to_excel(output_path, index=False, sheet_name="SoC LOT Scores")
-    print(f"✅ Saved: {output_path}")
-
-
-def upload_excel_to_gcs(local_path: str, molecule_slug: str) -> str | None:
-    """Optionally uploads the finished workbook to GCS, reusing GCS_REPORT_BASE_PATH."""
-    try:
-        gcs_client = get_gcs_client()
-        bucket = gcs_client.bucket(GCS_BUCKET)
-        gcs_path = f"{GCS_REPORT_BASE_PATH}/lot_scores/{molecule_slug}/soc_lot_scores.xlsx"
-        blob = bucket.blob(gcs_path)
-        blob.upload_from_filename(
-            local_path,
-            content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
-        gcs_uri = f"gs://{GCS_BUCKET}/{gcs_path}"
-        logger.info("[SOC_LOT] Uploaded results workbook to %s", gcs_uri)
-        print(f"☁️  Uploaded to: {gcs_uri}")
-        return gcs_uri
-    except Exception as exc:
-        logger.warning("[SOC_LOT] Failed to upload results workbook to GCS: %s", exc)
-        return None
+    load_job = bq_client.load_table_from_json(payload, table_id, job_config=job_config)
+    load_job.result()
+    logger.info("[SOC_LOT] Pushed %d row(s) to %s", len(payload), table_id)
+    print(f"☁️  Pushed {len(payload)} row(s) to {table_id}")
 
 
 # ==============================
@@ -598,17 +615,13 @@ def main() -> None:
             logger.exception("[SOC_LOT] Failed processing country '%s'", country)
 
     # final_lot_score is a per-drug aggregate across all countries:
-    # (US lot_score x 0.58) + 0.14 x sum(lot_score for every other country)
+    # (US lot_score x US_WEIGHT) + OTHER_COUNTRY_WEIGHT x sum(lot_score for every other country)
     final_scores = compute_final_lot_scores_per_drug(all_rows)
     for r in all_rows:
         r.final_lot_score = final_scores.get(r.drug_name)
 
-    slug = "_".join(d.lower() for d in drugs)
-    output_path = os.path.join(OUTPUT_FOLDER, f"soc_lot_scores_{slug}.xlsx")
-    save_results_to_excel(all_rows, output_path)
-
-    if os.getenv("SOC_LOT_UPLOAD_TO_GCS", "").lower() in {"1", "true", "yes"}:
-        upload_excel_to_gcs(output_path, slug)
+    print("\n☁️  Pushing results to BigQuery...")
+    push_results_to_bigquery(all_rows)
 
     print(f"\n{'=' * 50}")
     print("📊 SUMMARY")
