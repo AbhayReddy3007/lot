@@ -1,25 +1,36 @@
 """Entry point for the SoC → Lines-of-Therapy (LOT) scoring pipeline.
 
 All the actual logic (config, GCS/BigQuery/Gemini calls, benchmark caching,
-scoring, and the BigQuery push) lives in ``lot_scoring.py``. This module just
-wires those pieces together and exposes ``main()`` as the CLI entry point.
+scoring, and the BigQuery push) lives in ``lot_scoring.py``. PDF report
+generation lives in ``generate_lot_report.py``. This module just wires those
+pieces together and exposes ``main()`` as the CLI entry point.
 
-Place this module at ``medical_potential/line_of_treatment.py`` alongside
-``medical_potential/lot_scoring.py``.
+The drug to score is read from ``LOT_DRUG`` in config — this pipeline scores
+exactly one drug per run.
+
+Every run scores the drug and updates BigQuery. Report generation is opt-in:
+pass ``--report`` to also build the PDF (via ``generate_lot_report.py``)
+straight after the scores are pushed, using the values that were just
+written to BigQuery.
+
+Place this module at ``medical_potential/line_of_treatment/line_of_treatment.py``
+alongside ``medical_potential/line_of_treatment/lot_scoring.py`` and
+``medical_potential/line_of_treatment/generate_lot_report.py``.
 """
 
 from __future__ import annotations
 
+import argparse
 import logging
 
-from medical_potential.config import GCS_BUCKET, GCS_SOC_BASE_PATH
+from medical_potential.config import GCS_BUCKET, GCS_SOC_BASE_PATH, LOT_DRUG
+from medical_potential.line_of_treatment.generate_lot_report import generate_lot_reports
 from medical_potential.line_of_treatment.lot_scoring import (
     LotRow,
     build_overlay_prompt,
     compute_final_lot_scores_per_drug,
     discover_countries_gcs,
     lookup_moa,
-    parse_drugs,
     process_country,
     push_results_to_bigquery,
 )
@@ -31,8 +42,13 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def main() -> None:
-    drugs = parse_drugs()
+def run_scoring() -> None:
+    """Scores LOT_DRUG across all countries and pushes the results to BigQuery."""
+    if not LOT_DRUG:
+        raise SystemExit("LOT_DRUG is not set in config.py — cannot run scoring.")
+
+    drugs = [LOT_DRUG]
+    logger.info("[SOC_LOT] Drug to analyse: %s", LOT_DRUG)
 
     logger.info("[SOC_LOT] Looking up MoA from BigQuery...")
     drug_moa = lookup_moa(drugs)
@@ -66,6 +82,32 @@ def main() -> None:
     for country in countries:
         n = sum(1 for r in all_rows if r.country == country)
         logger.info("[SOC_LOT]   %s: %d row(s)", country, n)
+
+
+def run_report() -> None:
+    """Generates the Line of Treatment PDF for LOT_DRUG from the latest BigQuery data."""
+    if not LOT_DRUG:
+        raise SystemExit("LOT_DRUG is not set in config.py — cannot generate a report.")
+
+    logger.info("[LOT_REPORT] Generating report for: %s", LOT_DRUG)
+    generate_lot_reports([LOT_DRUG])
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Score LOT_DRUG's Line of Treatment across countries and push to BigQuery."
+    )
+    parser.add_argument(
+        "--report",
+        action="store_true",
+        help="Also generate the Line of Treatment PDF report after scoring, using the values just pushed to BigQuery.",
+    )
+    args = parser.parse_args()
+
+    run_scoring()
+
+    if args.report:
+        run_report()
 
 
 if __name__ == "__main__":
