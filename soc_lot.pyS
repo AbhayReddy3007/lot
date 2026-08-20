@@ -8,6 +8,10 @@ writes a single Excel workbook with one row per drug/country combination:
 
     drug_name, country, lot_score, lot_type, rationale, confidence, final_lot_score
 
+final_lot_score is a per-drug aggregate across all countries, NOT a per-row
+value: (US lot_score x 0.58) + 0.14 x sum(lot_score for every other country).
+It is repeated on every row for that drug.
+
 Place this module at ``medical_potential/soc_lot_scoring.py`` so it can reuse
 ``medical_potential.gcp_utils`` and ``medical_potential.config`` exactly like
 the rest of the package.
@@ -448,15 +452,30 @@ def map_lot_type_to_score(lot_type: str) -> int | None:
     return None
 
 
-def country_weight(country: str) -> float:
+def is_us(country: str) -> bool:
     normalized = re.sub(r"[_\-]+", " ", country).strip().lower()
-    return US_WEIGHT if normalized in US_ALIASES else OTHER_COUNTRY_WEIGHT
+    return normalized in US_ALIASES
 
 
-def compute_final_lot_score(lot_score: int | None, country: str) -> float | None:
-    if lot_score is None:
-        return None
-    return round(lot_score * country_weight(country), 4)
+def compute_final_lot_scores_per_drug(rows: list["LotRow"]) -> dict[str, float]:
+    """Computes one aggregate final_lot_score per drug across all countries.
+
+    final_lot_score = (US lot_score x 0.58) + 0.14 x sum(lot_score for every
+    other country). Countries with no resolvable lot_score are skipped.
+    """
+    scores_by_drug: dict[str, dict[str, list[int]]] = {}
+    for r in rows:
+        if r.lot_score is None:
+            continue
+        bucket = scores_by_drug.setdefault(r.drug_name, {"us": [], "other": []})
+        bucket["us" if is_us(r.country) else "other"].append(r.lot_score)
+
+    final_scores: dict[str, float] = {}
+    for drug, buckets in scores_by_drug.items():
+        us_score = sum(buckets["us"]) * US_WEIGHT  # normally 0 or 1 US row
+        other_score = sum(buckets["other"]) * OTHER_COUNTRY_WEIGHT
+        final_scores[drug] = round(us_score + other_score, 4)
+    return final_scores
 
 
 # ==============================
@@ -503,7 +522,7 @@ def process_country(country: str, blob_names: list[str], drugs: list[str], overl
                 lot_type=info["lot_type"],
                 rationale=info["rationale"],
                 confidence=info["confidence"],
-                final_lot_score=compute_final_lot_score(lot_score, country),
+                final_lot_score=None,  # filled in once, after all countries are processed
             )
         )
     return rows
@@ -577,6 +596,12 @@ def main() -> None:
         except Exception as exc:
             print(f"   ❌ Failed for {country}: {exc}")
             logger.exception("[SOC_LOT] Failed processing country '%s'", country)
+
+    # final_lot_score is a per-drug aggregate across all countries:
+    # (US lot_score x 0.58) + 0.14 x sum(lot_score for every other country)
+    final_scores = compute_final_lot_scores_per_drug(all_rows)
+    for r in all_rows:
+        r.final_lot_score = final_scores.get(r.drug_name)
 
     slug = "_".join(d.lower() for d in drugs)
     output_path = os.path.join(OUTPUT_FOLDER, f"soc_lot_scores_{slug}.xlsx")
