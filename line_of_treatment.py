@@ -8,10 +8,10 @@ pieces together and exposes ``main()`` as the CLI entry point.
 The drug to score is read from ``LOT_DRUG`` in config — this pipeline scores
 exactly one drug per run.
 
-Every run scores the drug and updates BigQuery. Report generation is opt-in:
-pass ``--report`` to also build the PDF (via ``generate_lot_report.py``)
-straight after the scores are pushed, using the values that were just
-written to BigQuery.
+Every run scores the drug and updates BigQuery, then generates the Line of
+Treatment PDF report by default (via ``generate_lot_report.py``), using the
+values that were just written to BigQuery. Pass ``--no-report`` to skip
+report generation and only run scoring + the BigQuery push.
 
 Place this module at ``medical_potential/line_of_treatment/line_of_treatment.py``
 alongside ``medical_potential/line_of_treatment/lot_scoring.py`` and
@@ -95,18 +95,18 @@ def run_report() -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Score LOT_DRUG's Line of Treatment across countries and push to BigQuery."
+        description="Score LOT_DRUG's Line of Treatment across countries, push to BigQuery, and generate the PDF report."
     )
     parser.add_argument(
-        "--report",
+        "--no-report",
         action="store_true",
-        help="Also generate the Line of Treatment PDF report after scoring, using the values just pushed to BigQuery.",
+        help="Skip PDF report generation and only run scoring + the BigQuery push.",
     )
     args = parser.parse_args()
 
     run_scoring()
 
-    if args.report:
+    if not args.no_report:
         run_report()
 
 
