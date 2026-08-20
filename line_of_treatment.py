@@ -13,7 +13,7 @@ from __future__ import annotations
 import logging
 
 from medical_potential.config import GCS_BUCKET, GCS_SOC_BASE_PATH
-from medical_potential.lot_scoring import (
+from medical_potential.line_of_treatment.lot_scoring import (
     LotRow,
     build_overlay_prompt,
     compute_final_lot_scores_per_drug,
