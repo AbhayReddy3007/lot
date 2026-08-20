@@ -14,10 +14,10 @@ value: (US lot_score x US_WEIGHT) + OTHER_COUNTRY_WEIGHT x sum(lot_score for
 every other country). It is repeated on every row for that drug.
 
 SoC benchmark extraction (the PDF-read + Gemini-extraction step) is cached to
-disk as JSON under ``LOT_BENCHMARK_PATH``, one file per country. On
-subsequent runs, if a cached benchmark file already exists for a country, the
-PDFs are not re-read and the benchmark is not re-generated — the cached
-benchmark text is reused directly for the overlay analysis.
+GCS as JSON under ``gs://GCS_BUCKET/{LOT_BENCHMARK_PATH}/``, one blob per
+country. On subsequent runs, if a cached benchmark blob already exists for a
+country, the PDFs are not re-read and the benchmark is not re-generated — the
+cached benchmark text is reused directly for the overlay analysis.
 
 The entry point (``main()``) lives in ``line_of_treatment.py``, which imports
 everything it needs from this module.
@@ -42,8 +42,9 @@ Add the following to ``medical_potential/config.py`` (they do not exist yet):
     US_WEIGHT                   # e.g. 0.58 — weight applied to the US lot_score
     OTHER_COUNTRY_WEIGHT        # e.g. 0.14 — weight applied to each non-US lot_score
     LOT_TABLE                   # BQ table results are pushed to, e.g. "soc_lot_scores"
-    LOT_BENCHMARK_PATH          # local folder path where per-country SoC benchmark
-                                #   JSON cache files are read from / written to
+    LOT_BENCHMARK_PATH          # GCS prefix (under GCS_BUCKET) where per-country
+                                #   SoC benchmark JSON cache blobs are read from /
+                                #   written to, e.g. "lot_benchmarks"
 
 PROJECT_ID and BQ_DATASET_ID are reused as-is (both for the MOA lookup table
 and for the LOT results table).
@@ -240,49 +241,65 @@ def extract_country_pdfs_text_gcs(blob_names: list[str]) -> str:
 
 
 # ==============================
-# BENCHMARK CACHE (local JSON, one file per country)
+# BENCHMARK CACHE (GCS JSON, one blob per country)
 # ==============================
 def _slugify_country(country: str) -> str:
     slug = re.sub(r"[^a-z0-9]+", "_", country.strip().lower())
     return slug.strip("_") or "unknown_country"
 
 
-def get_benchmark_cache_path(country: str) -> str:
-    return os.path.join(LOT_BENCHMARK_PATH, f"{_slugify_country(country)}.json")
+def get_benchmark_cache_blob_name(country: str) -> str:
+    """Returns the GCS blob name (path within GCS_BUCKET) for a country's cached benchmark."""
+    base = LOT_BENCHMARK_PATH.strip("/")
+    return f"{base}/{_slugify_country(country)}.json"
 
 
 def load_cached_benchmark(country: str) -> str | None:
-    """Returns the cached SoC benchmark text for a country, or None if absent."""
-    path = get_benchmark_cache_path(country)
-    if not os.path.exists(path):
-        return None
+    """Returns the cached SoC benchmark text for a country, or None if absent.
+
+    Reads from gs://GCS_BUCKET/{LOT_BENCHMARK_PATH}/{country_slug}.json.
+    """
+    blob_name = get_benchmark_cache_blob_name(country)
+    gcs_uri = f"gs://{GCS_BUCKET}/{blob_name}"
     try:
-        with open(path, encoding="utf-8") as f:
-            payload = json.load(f)
+        gcs_client = get_gcs_client()
+        bucket = gcs_client.bucket(GCS_BUCKET)
+        blob = bucket.blob(blob_name)
+        if not blob.exists():
+            return None
+        payload = json.loads(blob.download_as_text())
         soc_output = payload.get("soc_output")
         if soc_output:
-            logger.info("[SOC_LOT] Using cached benchmark for '%s': %s", country, path)
+            logger.info("[SOC_LOT] Using cached benchmark for '%s': %s", country, gcs_uri)
             return soc_output
     except Exception:
-        logger.exception("[SOC_LOT] Failed to read cached benchmark for '%s' at %s", country, path)
+        logger.exception("[SOC_LOT] Failed to read cached benchmark for '%s' at %s", country, gcs_uri)
     return None
 
 
 def save_benchmark_to_cache(country: str, soc_output: str) -> None:
-    """Writes the SoC benchmark text for a country to the local JSON cache."""
-    os.makedirs(LOT_BENCHMARK_PATH, exist_ok=True)
-    path = get_benchmark_cache_path(country)
+    """Writes the SoC benchmark text for a country to the GCS JSON cache.
+
+    Writes to gs://GCS_BUCKET/{LOT_BENCHMARK_PATH}/{country_slug}.json.
+    """
+    blob_name = get_benchmark_cache_blob_name(country)
+    gcs_uri = f"gs://{GCS_BUCKET}/{blob_name}"
     payload = {
         "country": country,
         "soc_output": soc_output,
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }
     try:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(payload, f, indent=2, ensure_ascii=False)
-        logger.info("[SOC_LOT] Cached benchmark for '%s' at %s", country, path)
+        gcs_client = get_gcs_client()
+        bucket = gcs_client.bucket(GCS_BUCKET)
+        blob = bucket.blob(blob_name)
+        blob.upload_from_string(
+            json.dumps(payload, indent=2, ensure_ascii=False),
+            content_type="application/json",
+        )
+        logger.info("[SOC_LOT] Cached benchmark for '%s' at %s", country, gcs_uri)
     except Exception:
-        logger.exception("[SOC_LOT] Failed to cache benchmark for '%s' at %s", country, path)
+        logger.exception("[SOC_LOT] Failed to cache benchmark for '%s' at %s", country, gcs_uri)
 
 
 # ==============================
@@ -563,7 +580,8 @@ def get_or_build_soc_benchmark(country: str, blob_names: list[str]) -> str:
     """Returns the SoC benchmark text for a country, using the local cache when present.
 
     Only reads PDFs from GCS and calls Gemini for extraction when no cached
-    benchmark JSON exists yet for this country under LOT_BENCHMARK_PATH.
+    benchmark JSON blob exists yet for this country under
+    gs://GCS_BUCKET/{LOT_BENCHMARK_PATH}/.
     """
     cached = load_cached_benchmark(country)
     if cached is not None:
