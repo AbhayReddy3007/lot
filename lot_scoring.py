@@ -1,4 +1,4 @@
-"""SoC → Lines-of-Therapy (LOT) scoring pipeline.
+"""SoC → Lines-of-Therapy (LOT) scoring — core logic.
 
 Reads country-level Standard-of-Care (SoC) PDFs from GCS (one subfolder per
 country under ``GCS_SOC_BASE_PATH``), looks up each drug's Mechanism of
@@ -13,7 +13,17 @@ final_lot_score is a per-drug aggregate across all countries, NOT a per-row
 value: (US lot_score x US_WEIGHT) + OTHER_COUNTRY_WEIGHT x sum(lot_score for
 every other country). It is repeated on every row for that drug.
 
-Place this module at ``medical_potential/soc_lot_scoring.py`` so it can reuse
+SoC benchmark extraction (the PDF-read + Gemini-extraction step) is cached to
+disk as JSON under ``LOT_BENCHMARK_PATH``, one file per country. On
+subsequent runs, if a cached benchmark file already exists for a country, the
+PDFs are not re-read and the benchmark is not re-generated — the cached
+benchmark text is reused directly for the overlay analysis.
+
+The entry point (``main()``) lives in ``line_of_treatment.py``, which imports
+everything it needs from this module.
+
+Place these modules at ``medical_potential/lot_scoring.py`` and
+``medical_potential/line_of_treatment.py`` so they can reuse
 ``medical_potential.gcp_utils`` and ``medical_potential.config`` exactly like
 the rest of the package.
 
@@ -21,19 +31,22 @@ NEW CONFIG REQUIRED
 --------------------
 Add the following to ``medical_potential/config.py`` (they do not exist yet):
 
-    MOA_LOOKUP_TABLE      # e.g. "brands"  — BQ table (under PROJECT_ID /
-                          #   BQ_DATASET_ID) with Cleaned_Generic_Name /
-                          #   Mechanism_of_Action / Mechanism_of_Action_Detailed
-    GCS_SOC_BASE_PATH     # e.g. "SOC"     — GCS prefix under GCS_BUCKET that
-                          #   contains one subfolder per country, each holding
-                          #   that country's SoC PDF(s)
-    MODEL_NAME            # e.g. "gemini-2.5-flash" — Gemini model used for
-                          #   both SoC extraction and overlay analysis
-    US_WEIGHT             # e.g. 0.58 — weight applied to the US lot_score
-    OTHER_COUNTRY_WEIGHT  # e.g. 0.14 — weight applied to each non-US lot_score
-    LOT_PROJECT_ID        # GCP project that hosts the LOT results table
-    LOT_DATASET_ID        # BQ dataset that hosts the LOT results table
-    LOT_TABLE             # BQ table results are pushed to, e.g. "soc_lot_scores"
+    MOA_LOOKUP_TABLE            # e.g. "brands" — BQ table (under PROJECT_ID /
+                                #   BQ_DATASET_ID) with Cleaned_Generic_Name /
+                                #   Mechanism_of_Action / Mechanism_of_Action_Detailed
+    GCS_SOC_BASE_PATH           # e.g. "SOC"    — GCS prefix under GCS_BUCKET that
+                                #   contains one subfolder per country, each holding
+                                #   that country's SoC PDF(s)
+    GEMINI_FLASH_PREVIEW_MODEL  # e.g. "gemini-2.5-flash" — Gemini model used for
+                                #   both SoC extraction and overlay analysis
+    US_WEIGHT                   # e.g. 0.58 — weight applied to the US lot_score
+    OTHER_COUNTRY_WEIGHT        # e.g. 0.14 — weight applied to each non-US lot_score
+    LOT_TABLE                   # BQ table results are pushed to, e.g. "soc_lot_scores"
+    LOT_BENCHMARK_PATH          # local folder path where per-country SoC benchmark
+                                #   JSON cache files are read from / written to
+
+PROJECT_ID and BQ_DATASET_ID are reused as-is (both for the MOA lookup table
+and for the LOT results table).
 
 GEMINI_API_KEY is loaded from the environment (.env), matching the existing
 scripts (U2.py / lot.py) rather than from config.py.
@@ -41,6 +54,7 @@ scripts (U2.py / lot.py) rather than from config.py.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -51,16 +65,16 @@ from datetime import datetime, timezone
 import fitz  # PyMuPDF
 from dotenv import load_dotenv
 from google import genai
+from google.cloud import bigquery
 from google.genai import types
 
 from medical_potential.config import (
     BQ_DATASET_ID,
     GCS_BUCKET,
     GCS_SOC_BASE_PATH,
-    LOT_DATASET_ID,
-    LOT_PROJECT_ID,
+    GEMINI_FLASH_PREVIEW_MODEL,
+    LOT_BENCHMARK_PATH,
     LOT_TABLE,
-    MODEL_NAME,
     MOA_LOOKUP_TABLE,
     OTHER_COUNTRY_WEIGHT,
     PROJECT_ID,
@@ -76,7 +90,7 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 if not GEMINI_API_KEY:
-    raise ValueError("❌ GEMINI_API_KEY not found.")
+    raise ValueError("GEMINI_API_KEY not found.")
 client = genai.Client(api_key=GEMINI_API_KEY)
 
 # ==============================
@@ -117,9 +131,9 @@ def parse_drugs() -> list[str]:
     else:
         user_input = input("No drugs supplied. Enter drug names separated by spaces: ").strip()
         if not user_input:
-            raise SystemExit("❌ No drug names provided. Exiting.")
+            raise SystemExit("No drug names provided. Exiting.")
         drugs = user_input.split()
-    print(f"💊 Drugs to analyse: {', '.join(drugs)}")
+    logger.info("[SOC_LOT] Drugs to analyse: %s", ", ".join(drugs))
     return drugs
 
 
@@ -140,7 +154,6 @@ def lookup_moa(drug_names: list[str]) -> dict[str, dict]:
         FROM {table_ref}
         WHERE LOWER(Cleaned_Generic_Name) IN ({placeholders})
     """
-    from google.cloud import bigquery  # local import keeps top-level deps minimal
 
     job_config = bigquery.QueryJobConfig(
         query_parameters=[
@@ -163,7 +176,7 @@ def lookup_moa(drug_names: list[str]) -> dict[str, dict]:
         if match:
             drug_moa[drug] = match
         else:
-            print(f"⚠️  '{drug}' not found in BigQuery table. Using 'Unknown' as MOA.")
+            logger.warning("[SOC_LOT] '%s' not found in BigQuery table. Using 'Unknown' as MOA.", drug)
             drug_moa[drug] = {"moa": "Unknown", "moa_detailed": ""}
 
     return drug_moa
@@ -195,7 +208,7 @@ def discover_countries_gcs(base_path: str = GCS_SOC_BASE_PATH) -> dict[str, list
         countries.setdefault(country, []).append(blob.name)
 
     if not countries:
-        raise FileNotFoundError(f"❌ No country PDFs found under gs://{GCS_BUCKET}/{prefix}")
+        raise FileNotFoundError(f"No country PDFs found under gs://{GCS_BUCKET}/{prefix}")
 
     for country in countries:
         countries[country].sort()
@@ -224,6 +237,52 @@ def extract_country_pdfs_text_gcs(blob_names: list[str]) -> str:
         filename = blob_name.rsplit("/", 1)[-1]
         sections.append(f"--- Document {i}: {filename} ---\n{text}")
     return "\n\n".join(sections)
+
+
+# ==============================
+# BENCHMARK CACHE (local JSON, one file per country)
+# ==============================
+def _slugify_country(country: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "_", country.strip().lower())
+    return slug.strip("_") or "unknown_country"
+
+
+def get_benchmark_cache_path(country: str) -> str:
+    return os.path.join(LOT_BENCHMARK_PATH, f"{_slugify_country(country)}.json")
+
+
+def load_cached_benchmark(country: str) -> str | None:
+    """Returns the cached SoC benchmark text for a country, or None if absent."""
+    path = get_benchmark_cache_path(country)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            payload = json.load(f)
+        soc_output = payload.get("soc_output")
+        if soc_output:
+            logger.info("[SOC_LOT] Using cached benchmark for '%s': %s", country, path)
+            return soc_output
+    except Exception:
+        logger.exception("[SOC_LOT] Failed to read cached benchmark for '%s' at %s", country, path)
+    return None
+
+
+def save_benchmark_to_cache(country: str, soc_output: str) -> None:
+    """Writes the SoC benchmark text for a country to the local JSON cache."""
+    os.makedirs(LOT_BENCHMARK_PATH, exist_ok=True)
+    path = get_benchmark_cache_path(country)
+    payload = {
+        "country": country,
+        "soc_output": soc_output,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, ensure_ascii=False)
+        logger.info("[SOC_LOT] Cached benchmark for '%s' at %s", country, path)
+    except Exception:
+        logger.exception("[SOC_LOT] Failed to cache benchmark for '%s' at %s", country, path)
 
 
 # ==============================
@@ -373,7 +432,7 @@ def clean_text(text: str) -> str:
 # ==============================
 def run_soc_extraction(pdf_text: str, country: str) -> str:
     response = client.models.generate_content(
-        model=MODEL_NAME,
+        model=GEMINI_FLASH_PREVIEW_MODEL,
         contents=(f"Country: {country}\n\nBelow are the full SoC document(s) for {country}:\n\n{pdf_text}"),
         config=types.GenerateContentConfig(system_instruction=SYSTEM_INSTRUCTION, temperature=0.1),
     )
@@ -382,7 +441,7 @@ def run_soc_extraction(pdf_text: str, country: str) -> str:
 
 def run_overlay_analysis(soc_text: str, overlay_prompt: str) -> str:
     response = client.models.generate_content(
-        model=MODEL_NAME,
+        model=GEMINI_FLASH_PREVIEW_MODEL,
         contents=(
             "Below is the extracted SoC benchmark. "
             "Use it as the sole reference for LOT assignment.\n\n"
@@ -467,8 +526,9 @@ def is_us(country: str) -> bool:
 def compute_final_lot_scores_per_drug(rows: list["LotRow"]) -> dict[str, float]:
     """Computes one aggregate final_lot_score per drug across all countries.
 
-    final_lot_score = (US lot_score x 0.58) + 0.14 x sum(lot_score for every
-    other country). Countries with no resolvable lot_score are skipped.
+    final_lot_score = (US lot_score x US_WEIGHT) + OTHER_COUNTRY_WEIGHT x sum(
+    lot_score for every other country). Countries with no resolvable
+    lot_score are skipped.
     """
     scores_by_drug: dict[str, dict[str, list[int]]] = {}
     for r in rows:
@@ -499,22 +559,37 @@ class LotRow:
     final_lot_score: float | None
 
 
-def process_country(country: str, blob_names: list[str], drugs: list[str], overlay_prompt: str) -> list[LotRow]:
-    n_pdfs = len(blob_names)
-    print(f"\n{'=' * 50}")
-    print(f"🌍 Processing: {country}  ({n_pdfs} PDF{'s' if n_pdfs > 1 else ''})")
-    print(f"{'=' * 50}")
+def get_or_build_soc_benchmark(country: str, blob_names: list[str]) -> str:
+    """Returns the SoC benchmark text for a country, using the local cache when present.
 
-    print(f"   📄 Reading {n_pdfs} PDF(s) from GCS...")
+    Only reads PDFs from GCS and calls Gemini for extraction when no cached
+    benchmark JSON exists yet for this country under LOT_BENCHMARK_PATH.
+    """
+    cached = load_cached_benchmark(country)
+    if cached is not None:
+        return cached
+
+    n_pdfs = len(blob_names)
+    logger.info("[SOC_LOT] Reading %d PDF(s) from GCS for '%s'...", n_pdfs, country)
     pdf_text = extract_country_pdfs_text_gcs(blob_names)
 
-    print(f"   🧠 Extracting SoC for {country}...")
+    logger.info("[SOC_LOT] Extracting SoC benchmark for '%s'...", country)
     soc_output = run_soc_extraction(pdf_text, country)
 
-    print(f"   ⚡ Running overlay analysis for {country}...")
+    save_benchmark_to_cache(country, soc_output)
+    return soc_output
+
+
+def process_country(country: str, blob_names: list[str], drugs: list[str], overlay_prompt: str) -> list[LotRow]:
+    n_pdfs = len(blob_names)
+    logger.info("[SOC_LOT] Processing: %s (%d PDF%s)", country, n_pdfs, "s" if n_pdfs != 1 else "")
+
+    soc_output = get_or_build_soc_benchmark(country, blob_names)
+
+    logger.info("[SOC_LOT] Running overlay analysis for '%s'...", country)
     overlay_output = run_overlay_analysis(soc_output, overlay_prompt)
 
-    print("   🔎 Parsing structured LOT results...")
+    logger.info("[SOC_LOT] Parsing structured LOT results for '%s'...", country)
     parsed = parse_overlay_output(overlay_output, drugs)
 
     rows: list[LotRow] = []
@@ -538,8 +613,6 @@ def process_country(country: str, blob_names: list[str], drugs: list[str], overl
 # ==============================
 # OUTPUT: BIGQUERY
 # ==============================
-from google.cloud import bigquery  # noqa: E402  (kept near its single use, mirrors gcp_utils style)
-
 LOT_RESULTS_SCHEMA: list[bigquery.SchemaField] = [
     bigquery.SchemaField("drug_name", "STRING", mode="NULLABLE"),
     bigquery.SchemaField("country", "STRING", mode="NULLABLE"),
@@ -559,7 +632,7 @@ def push_results_to_bigquery(rows: list[LotRow]) -> None:
     append mode, creating the table if it does not already exist, matching
     ``gcp_utils.append_dimension_score_to_bigquery``.
     """
-    table_id = f"{LOT_PROJECT_ID}.{LOT_DATASET_ID}.{LOT_TABLE}"
+    table_id = f"{PROJECT_ID}.{BQ_DATASET_ID}.{LOT_TABLE}"
     timestamp = datetime.now(timezone.utc).isoformat()
 
     payload = [
@@ -585,51 +658,3 @@ def push_results_to_bigquery(rows: list[LotRow]) -> None:
     load_job = bq_client.load_table_from_json(payload, table_id, job_config=job_config)
     load_job.result()
     logger.info("[SOC_LOT] Pushed %d row(s) to %s", len(payload), table_id)
-    print(f"☁️  Pushed {len(payload)} row(s) to {table_id}")
-
-
-# ==============================
-# MAIN
-# ==============================
-def main() -> None:
-    drugs = parse_drugs()
-
-    print("🔍 Looking up MoA from BigQuery...")
-    drug_moa = lookup_moa(drugs)
-    for drug, info in drug_moa.items():
-        detail = f" ({info['moa_detailed']})" if info["moa_detailed"] else ""
-        print(f"   {drug} → {info['moa']}{detail}")
-
-    overlay_prompt = build_overlay_prompt(drugs, drug_moa)
-
-    print(f"\n📂 Scanning gs://{GCS_BUCKET}/{GCS_SOC_BASE_PATH}...")
-    countries = discover_countries_gcs()
-    print(f"   Found {len(countries)} country folder(s): {', '.join(countries.keys())}")
-
-    all_rows: list[LotRow] = []
-    for country, blob_names in countries.items():
-        try:
-            all_rows.extend(process_country(country, blob_names, drugs, overlay_prompt))
-        except Exception as exc:
-            print(f"   ❌ Failed for {country}: {exc}")
-            logger.exception("[SOC_LOT] Failed processing country '%s'", country)
-
-    # final_lot_score is a per-drug aggregate across all countries:
-    # (US lot_score x US_WEIGHT) + OTHER_COUNTRY_WEIGHT x sum(lot_score for every other country)
-    final_scores = compute_final_lot_scores_per_drug(all_rows)
-    for r in all_rows:
-        r.final_lot_score = final_scores.get(r.drug_name)
-
-    print("\n☁️  Pushing results to BigQuery...")
-    push_results_to_bigquery(all_rows)
-
-    print(f"\n{'=' * 50}")
-    print("📊 SUMMARY")
-    print(f"{'=' * 50}")
-    for country in countries:
-        n = sum(1 for r in all_rows if r.country == country)
-        print(f"   ✅ {country}: {n} row(s)")
-
-
-if __name__ == "__main__":
-    main()
