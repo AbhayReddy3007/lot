@@ -13,13 +13,13 @@ final_lot_score is a per-drug aggregate across all countries, NOT a per-row
 value: (US lot_score x US_WEIGHT) + OTHER_COUNTRY_WEIGHT x sum(lot_score for
 every other country). It is repeated on every row for that drug.
 
-SoC benchmark extraction (the PDF-read + Gemini-extraction step) always runs
-fresh, every run — PDFs are re-read and the benchmark is re-generated every
-time, matching l.py. The resulting benchmark is also rendered as a Word
-document (like l.py's DOCX output) and saved to
-``gs://GCS_BUCKET/{LOT_BENCHMARK_PATH}/docs/``, one file per country. The
-overlay/classification step runs against the text read back from that
-generated document, not the raw in-memory string.
+SoC benchmark extraction (the PDF-read + Gemini-extraction step) is cached
+as a Word document, one file per country, at
+``gs://GCS_BUCKET/{LOT_BENCHMARK_PATH}/docs/``. On each run, if a benchmark
+DOCX already exists for a country, the PDFs are not re-read and the
+benchmark is not re-generated — its text is read back and reused directly
+for the overlay analysis. Delete a country's DOCX to force a fresh
+re-extraction from its PDFs on the next run.
 
 The entry point (``main()``) lives in ``line_of_treatment.py``, which imports
 everything it needs from this module.
@@ -301,16 +301,10 @@ def get_soc_benchmark_docx_blob_name(country: str) -> str:
     return f"{base}/docs/{_slugify_country(country)}.docx"
 
 
-def save_soc_benchmark_docx(country: str, soc_output: str) -> str:
-    """Writes the SoC benchmark as a Word document to GCS. Returns the blob name.
-
-    This always overwrites any previous document for the country — the DOCX
-    is a record of the current run's benchmark, not a cache to short-circuit
-    future runs.
-    """
+def save_soc_benchmark_docx(country: str, docx_bytes: bytes) -> str:
+    """Writes the SoC benchmark Word document bytes to GCS. Returns the blob name."""
     blob_name = get_soc_benchmark_docx_blob_name(country)
     gcs_uri = f"gs://{GCS_BUCKET}/{blob_name}"
-    docx_bytes = build_soc_benchmark_docx_bytes(country, soc_output)
     try:
         gcs_client = get_gcs_client()
         bucket = gcs_client.bucket(GCS_BUCKET)
@@ -329,6 +323,29 @@ def extract_text_from_docx_bytes(docx_bytes: bytes) -> str:
     """Reads back the plain text content of a generated SoC benchmark DOCX, one paragraph per line."""
     doc = Document(io.BytesIO(docx_bytes))
     return "\n".join(p.text for p in doc.paragraphs)
+
+
+def load_soc_benchmark_from_docx_if_exists(country: str) -> str | None:
+    """Returns the SoC benchmark text from the country's existing DOCX, or None if it isn't there yet.
+
+    Reads from gs://GCS_BUCKET/{LOT_BENCHMARK_PATH}/docs/{country_slug}.docx.
+    Delete that blob (or the whole docs/ prefix) to force a fresh PDF
+    re-extraction for a country on the next run.
+    """
+    blob_name = get_soc_benchmark_docx_blob_name(country)
+    gcs_uri = f"gs://{GCS_BUCKET}/{blob_name}"
+    try:
+        gcs_client = get_gcs_client()
+        bucket = gcs_client.bucket(GCS_BUCKET)
+        blob = bucket.blob(blob_name)
+        if not blob.exists():
+            return None
+        docx_bytes = blob.download_as_bytes()
+        logger.info("[SOC_LOT] Reusing existing SoC benchmark DOCX for '%s': %s", country, gcs_uri)
+        return extract_text_from_docx_bytes(docx_bytes)
+    except Exception:
+        logger.exception("[SOC_LOT] Failed to read existing SoC benchmark DOCX for '%s' at %s", country, gcs_uri)
+        return None
 
 
 def load_soc_benchmark_from_docx(country: str, docx_bytes: bytes | None = None) -> str:
@@ -621,20 +638,22 @@ class LotRow:
 
 
 def get_or_build_soc_benchmark(country: str, blob_names: list[str]) -> str:
-    """Builds the SoC benchmark for a country fresh, generates a Word document
-    for it (like l.py does), and returns the text read back from that
-    document — this is what the overlay/classification step runs against.
+    """Returns the SoC benchmark text for a country, reusing the existing
+    benchmark DOCX when one is already there instead of regenerating it.
 
-    PDFs are always re-read and re-extracted on every run; there is no
-    silent cache short-circuit here. A previous version of this function
-    reused a cached JSON benchmark blob whenever one already existed for the
-    country, which meant classification could silently run against a stale
-    benchmark from an earlier run even when the PDFs had since changed —
-    diverging from l.py, which always extracts fresh. That behavior has been
-    removed.
+    If gs://GCS_BUCKET/{LOT_BENCHMARK_PATH}/docs/{country_slug}.docx already
+    exists, its text is read back directly — the PDFs are not re-read and
+    no new Gemini extraction call is made. PDFs are only read and the
+    benchmark only (re-)built via Gemini, then saved as a Word document
+    (like l.py's DOCX output), when no benchmark DOCX exists yet for this
+    country. Delete that DOCX in GCS to force a fresh re-extraction.
     """
+    existing = load_soc_benchmark_from_docx_if_exists(country)
+    if existing is not None:
+        return existing
+
     n_pdfs = len(blob_names)
-    logger.info("[SOC_LOT] Reading %d PDF(s) from GCS for '%s'...", n_pdfs, country)
+    logger.info("[SOC_LOT] No existing benchmark DOCX for '%s' — reading %d PDF(s) from GCS...", country, n_pdfs)
     pdf_text = extract_country_pdfs_text_gcs(blob_names)
 
     logger.info("[SOC_LOT] Extracting SoC benchmark for '%s'...", country)
@@ -642,7 +661,7 @@ def get_or_build_soc_benchmark(country: str, blob_names: list[str]) -> str:
 
     logger.info("[SOC_LOT] Generating SoC benchmark DOCX for '%s'...", country)
     docx_bytes = build_soc_benchmark_docx_bytes(country, soc_output)
-    save_soc_benchmark_docx(country, soc_output)
+    save_soc_benchmark_docx(country, docx_bytes)
 
     # Classify against the text read back from the generated document itself
     # (not the raw in-memory string) so classification is always based on
@@ -697,13 +716,30 @@ LOT_RESULTS_SCHEMA: list[bigquery.SchemaField] = [
 
 
 def _ensure_lot_table_exists(bq_client: bigquery.Client, table_id: str) -> None:
-    """Creates the LOT results table with ``LOT_RESULTS_SCHEMA`` if it doesn't exist yet.
+    """Creates the LOT results table with ``LOT_RESULTS_SCHEMA`` if it doesn't exist yet,
+    and patches in any columns from ``LOT_RESULTS_SCHEMA`` that are missing from an
+    already-existing table (e.g. a table created by an older version of this schema).
 
-    A MERGE statement (unlike a load job) requires the target table to
-    already exist, so this is called before every upsert.
+    A MERGE statement (unlike a load job) requires the target table to already
+    exist AND to already have every column referenced in the query — unlike
+    ``create_table(..., exists_ok=True)``, which no-ops on an existing table
+    without reconciling its schema, so a stale table missing newer columns
+    (like ``updated_at``) would fail every MERGE with "Unrecognized name"
+    until fixed manually. This checks for and adds any missing columns.
     """
     table = bigquery.Table(table_id, schema=LOT_RESULTS_SCHEMA)
-    bq_client.create_table(table, exists_ok=True)
+    table = bq_client.create_table(table, exists_ok=True)
+
+    existing_field_names = {f.name for f in table.schema}
+    missing_fields = [f for f in LOT_RESULTS_SCHEMA if f.name not in existing_field_names]
+    if missing_fields:
+        logger.info(
+            "[SOC_LOT] Table %s is missing column(s) %s — adding them now.",
+            table_id,
+            ", ".join(f.name for f in missing_fields),
+        )
+        table.schema = list(table.schema) + missing_fields
+        bq_client.update_table(table, ["schema"])
 
 
 def push_results_to_bigquery(rows: list[LotRow]) -> None:
