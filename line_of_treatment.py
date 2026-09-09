@@ -3,16 +3,15 @@
 All the actual logic (config, GCS/BigQuery/Gemini calls, benchmark caching,
 scoring, and the BigQuery push) lives in ``lot_scoring.py``. PDF report
 generation lives in ``generate_lot_report.py``. This module just wires those
-pieces together and exposes ``line_of_treatment()`` as the entry point.
+pieces together and exposes ``main()`` as the CLI entry point.
 
 The drug to score is read from ``LOT_DRUG`` in config — this pipeline scores
 exactly one drug per run.
 
-Calling ``line_of_treatment()`` (directly, or via
-``python -m medical_potential.line_of_treatment.line_of_treatment``) always
-runs all three steps in order: score the drug across all countries, push the
-results to BigQuery, then generate the Line of Treatment PDF report from the
-values that were just written.
+Every run scores the drug and updates BigQuery, then generates the Line of
+Treatment PDF report by default (via ``generate_lot_report.py``), using the
+values that were just written to BigQuery. Pass ``--no-report`` to skip
+report generation and only run scoring + the BigQuery push.
 
 Place this module at ``medical_potential/line_of_treatment/line_of_treatment.py``
 alongside ``medical_potential/line_of_treatment/lot_scoring.py`` and
@@ -21,6 +20,7 @@ alongside ``medical_potential/line_of_treatment/lot_scoring.py`` and
 
 from __future__ import annotations
 
+import argparse
 import logging
 
 from medical_potential.config import GCS_BUCKET, GCS_SOC_BASE_PATH, LOT_DRUG
@@ -93,11 +93,22 @@ def run_report() -> None:
     generate_lot_reports([LOT_DRUG])
 
 
-def line_of_treatment() -> None:
-    """Runs the full pipeline for LOT_DRUG: score, push to BigQuery, generate report."""
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Score LOT_DRUG's Line of Treatment across countries, push to BigQuery, and generate the PDF report."
+    )
+    parser.add_argument(
+        "--no-report",
+        action="store_true",
+        help="Skip PDF report generation and only run scoring + the BigQuery push.",
+    )
+    args = parser.parse_args()
+
     run_scoring()
-    run_report()
+
+    if not args.no_report:
+        run_report()
 
 
 if __name__ == "__main__":
-    line_of_treatment()
+    main()
