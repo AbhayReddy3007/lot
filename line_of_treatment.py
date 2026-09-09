@@ -14,8 +14,10 @@ values that were just written to BigQuery. Pass ``--no-report`` to skip
 report generation and only run scoring + the BigQuery push.
 
 Place this module at ``medical_potential/line_of_treatment/line_of_treatment.py``
-alongside ``medical_potential/line_of_treatment/lot_scoring.py`` and
-``medical_potential/line_of_treatment/generate_lot_report.py``.
+alongside ``medical_potential/line_of_treatment/lot_scoring.py``. Report and
+rationale generation live one level deeper, in
+``medical_potential/line_of_treatment/generate_report_and_rationale/``, which
+holds ``generate_lot_report.py`` and ``generate_rationale.py``.
 """
 
 from __future__ import annotations
@@ -24,7 +26,9 @@ import argparse
 import logging
 
 from medical_potential.config import GCS_BUCKET, GCS_SOC_BASE_PATH, LOT_DRUG
-from medical_potential.line_of_treatment.generate_lot_report import generate_lot_reports
+from medical_potential.line_of_treatment.generate_report_and_rationale.generate_lot_report import (
+    generate_lot_reports,
+)
 from medical_potential.line_of_treatment.lot_scoring import (
     LotRow,
     build_overlay_prompt,
