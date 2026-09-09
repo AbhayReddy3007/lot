@@ -639,40 +639,82 @@ LOT_RESULTS_SCHEMA: list[bigquery.SchemaField] = [
     bigquery.SchemaField("rationale", "STRING", mode="NULLABLE"),
     bigquery.SchemaField("confidence", "INTEGER", mode="NULLABLE"),
     bigquery.SchemaField("final_lot_score", "FLOAT", mode="NULLABLE"),
-    bigquery.SchemaField("timestamp", "TIMESTAMP", mode="NULLABLE"),
+    bigquery.SchemaField("created_at", "TIMESTAMP", mode="NULLABLE"),
+    bigquery.SchemaField("updated_at", "TIMESTAMP", mode="NULLABLE"),
 ]
 
 
-def push_results_to_bigquery(rows: list[LotRow]) -> None:
-    """Pushes all LOT result rows to the configured BigQuery table.
+def _ensure_lot_table_exists(bq_client: bigquery.Client, table_id: str) -> None:
+    """Creates the LOT results table with ``LOT_RESULTS_SCHEMA`` if it doesn't exist yet.
 
-    Reuses the ``gcp_utils.get_bq_client`` credential pattern and writes in
-    append mode, creating the table if it does not already exist, matching
-    ``gcp_utils.append_dimension_score_to_bigquery``.
+    A MERGE statement (unlike a load job) requires the target table to
+    already exist, so this is called before every upsert.
     """
-    table_id = f"{PROJECT_ID}.{BQ_DATASET_ID}.{LOT_TABLE}"
-    timestamp = datetime.now(timezone.utc).isoformat()
+    table = bigquery.Table(table_id, schema=LOT_RESULTS_SCHEMA)
+    bq_client.create_table(table, exists_ok=True)
 
-    payload = [
-        {
-            "drug_name": r.drug_name,
-            "country": r.country,
-            "lot_score": r.lot_score,
-            "lot_type": r.lot_type,
-            "rationale": r.rationale,
-            "confidence": r.confidence,
-            "final_lot_score": r.final_lot_score,
-            "timestamp": timestamp,
-        }
+
+def push_results_to_bigquery(rows: list[LotRow]) -> None:
+    """Upserts all LOT result rows into the configured BigQuery table.
+
+    ``(drug_name, country)`` is treated as the unique key: this runs a
+    MERGE so that re-scoring a drug/country pair updates the existing row
+    in place instead of appending a duplicate.
+
+    - On first insert for a (drug_name, country) pair: both ``created_at``
+      and ``updated_at`` are set to the current run's timestamp.
+    - On every subsequent run for that same pair: only ``updated_at`` (and
+      the scored fields) change — ``created_at`` is left untouched.
+    """
+    if not rows:
+        logger.info("[SOC_LOT] No rows to push — skipping.")
+        return
+
+    table_id = f"{PROJECT_ID}.{BQ_DATASET_ID}.{LOT_TABLE}"
+    now = datetime.now(timezone.utc).isoformat()
+
+    bq_client = get_bq_client()
+    _ensure_lot_table_exists(bq_client, table_id)
+
+    struct_params = [
+        bigquery.StructQueryParameter(
+            None,
+            bigquery.ScalarQueryParameter("drug_name", "STRING", r.drug_name),
+            bigquery.ScalarQueryParameter("country", "STRING", r.country),
+            bigquery.ScalarQueryParameter("lot_score", "INT64", r.lot_score),
+            bigquery.ScalarQueryParameter("lot_type", "STRING", r.lot_type),
+            bigquery.ScalarQueryParameter("rationale", "STRING", r.rationale),
+            bigquery.ScalarQueryParameter("confidence", "INT64", r.confidence),
+            bigquery.ScalarQueryParameter("final_lot_score", "FLOAT64", r.final_lot_score),
+            bigquery.ScalarQueryParameter("updated_at", "TIMESTAMP", now),
+        )
         for r in rows
     ]
 
-    bq_client = get_bq_client()
-    job_config = bigquery.LoadJobConfig(
-        schema=LOT_RESULTS_SCHEMA,
-        write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
-        create_disposition=bigquery.CreateDisposition.CREATE_IF_NEEDED,
+    merge_query = f"""
+        MERGE `{table_id}` T
+        USING (SELECT * FROM UNNEST(@rows)) S
+        ON T.drug_name = S.drug_name AND T.country = S.country
+        WHEN MATCHED THEN
+            UPDATE SET
+                lot_score = S.lot_score,
+                lot_type = S.lot_type,
+                rationale = S.rationale,
+                confidence = S.confidence,
+                final_lot_score = S.final_lot_score,
+                updated_at = S.updated_at
+        WHEN NOT MATCHED THEN
+            INSERT (drug_name, country, lot_score, lot_type, rationale, confidence, final_lot_score, created_at, updated_at)
+            VALUES (S.drug_name, S.country, S.lot_score, S.lot_type, S.rationale, S.confidence, S.final_lot_score, S.updated_at, S.updated_at)
+    """
+
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[bigquery.ArrayQueryParameter("rows", "STRUCT", struct_params)]
     )
-    load_job = bq_client.load_table_from_json(payload, table_id, job_config=job_config)
-    load_job.result()
-    logger.info("[SOC_LOT] Pushed %d row(s) to %s", len(payload), table_id)
+    query_job = bq_client.query(merge_query, job_config=job_config)
+    query_job.result()
+    logger.info(
+        "[SOC_LOT] Upserted %d row(s) into %s (unique on drug_name + country)",
+        len(rows),
+        table_id,
+    )
