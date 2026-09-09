@@ -10,10 +10,10 @@ used, together with the most recently computed final_lot_score for that
 drug. (drug_name, country) is unique in LOT_TABLE, so this is normally a
 1:1 lookup rather than a real "latest of many" pick.
 
-The report pulls ALL available fields from the LOT_TABLE (per-country
-lot_score, lot_type, rationale, confidence, and the aggregate
-final_lot_score) and asks Gemini to turn them into a business-facing
-narrative.
+The report pulls the fields it needs from LOT_TABLE (per-country lot_score,
+lot_type, rationale, and the aggregate final_lot_score — confidence is
+intentionally excluded from both the query and the report) and asks Gemini
+to turn them into a business-facing narrative.
 
 Report structure (single-drug, business-facing):
   - Title block (drug name + final LOT score)
@@ -23,7 +23,9 @@ Report structure (single-drug, business-facing):
   - Line-of-Treatment Profile Summary
   - LOT scoring reference table (end of document)
 
-Each report is written to:
+``LOT_REPORT_PATH`` is a GCS location (either a full ``gs://bucket/prefix``
+URI, or a bucket-relative prefix under ``GCS_BUCKET``). Each report is built
+locally in a temp file, then uploaded to:
     {LOT_REPORT_PATH}/{drug_name}/Line_of_Treatment.pdf
 
 Usage:
@@ -47,6 +49,7 @@ import re
 import json
 import argparse
 import logging
+import tempfile
 from datetime import datetime
 from pathlib import Path
 
@@ -73,12 +76,13 @@ from google.genai import types
 
 from medical_potential.config import (
     BQ_DATASET_ID,
+    GCS_BUCKET,
     GEMINI_FLASH_PREVIEW_MODEL,
     LOT_REPORT_PATH,
     LOT_TABLE,
     PROJECT_ID,
 )
-from medical_potential.gcp_utils import get_bq_client
+from medical_potential.gcp_utils import get_bq_client, get_gcs_client
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -161,7 +165,9 @@ def load_from_bigquery(drugs: list[str] | None = None) -> list[dict]:
 
     query = f"""
         WITH ranked AS (
-            SELECT *,
+            SELECT
+                drug_name, country, lot_score, lot_type, rationale,
+                final_lot_score, created_at, updated_at,
                 ROW_NUMBER() OVER (
                     PARTITION BY drug_name, country ORDER BY updated_at DESC
                 ) AS _rn
@@ -218,20 +224,12 @@ def extract_drug_stats(drug_name: str, bucket: dict) -> dict:
         except (ValueError, TypeError):
             pass
 
-        confidence_raw = row.get("confidence")
-        confidence_int = None
-        try:
-            confidence_int = int(float(confidence_raw))
-        except (ValueError, TypeError):
-            pass
-
         countries.append({
             "country": safe(row.get("country")),
             "lot_score": score_int,
             "lot_score_label": LOT_SCORE_LABEL.get(score_int, "N/A") if score_int else "N/A",
             "lot_type": safe(row.get("lot_type")),
             "rationale": safe(row.get("rationale"), ""),
-            "confidence": confidence_int,
         })
 
     final_score_raw = bucket.get("final_lot_score")
@@ -272,7 +270,7 @@ def generate_lot_narrative(stats: dict) -> dict:
 
     country_lines = []
     for c in stats["countries"]:
-        line = f"- {c['country']}: LOT Score {c['lot_score']}/5 ({c['lot_type'] or 'N/A'}), Confidence {c['confidence']}%"
+        line = f"- {c['country']}: LOT Score {c['lot_score']}/5 ({c['lot_type'] or 'N/A'})"
         if c["rationale"]:
             line += f" — Rationale: {c['rationale']}"
         country_lines.append(line)
@@ -307,7 +305,6 @@ Per-country breakdown:
    - Highlight:
      - Where the drug is positioned (first-line vs later-line) in the US versus other markets
      - Any notable geographic variation in treatment-line placement
-     - Overall confidence in the classifications
    - Focus on what the data shows, not how it was calculated
 
 2. Follow with: "Insights and Implications"
@@ -340,8 +337,7 @@ Respond ONLY with a valid JSON object (no markdown fences, no extra text):
       "Key finding 1 — MUST state the aggregate final LOT score as X out of 5 (use the exact score from the data) and what it indicates in plain terms",
       "Key finding 2 about US treatment-line positioning specifically",
       "Key finding 3 about positioning in other markets and any notable variation",
-      "Key finding 4 about overall confidence in the classifications",
-      "Key finding 5 about any other important observation"
+      "Key finding 4 about any other important observation"
     ],
     "geographic_variation_detail": "2-3 sentences in plain language about how treatment-line placement varies (or doesn't) across the countries analysed",
     "therapy_line_detail": "2-3 sentences describing where the drug typically sits in the treatment pathway and what that means for patients reaching it"
@@ -453,20 +449,17 @@ def _country_breakdown_table(countries: list[dict], styles: dict) -> Table:
         Paragraph("Country", styles["cell_header"]),
         Paragraph("LOT Score", styles["cell_header"]),
         Paragraph("LOT Type", styles["cell_header"]),
-        Paragraph("Confidence", styles["cell_header"]),
     ]
     rows = [header]
     for c in countries:
         score_display = f"{c['lot_score']}/5" if c["lot_score"] is not None else "N/A"
-        confidence_display = f"{c['confidence']}%" if c["confidence"] is not None else "N/A"
         rows.append([
             Paragraph(c["country"], ParagraphStyle("CBCountry", parent=styles["cell"], alignment=TA_LEFT)),
             Paragraph(score_display, styles["cell"]),
             Paragraph(c["lot_type"] or "N/A", ParagraphStyle("CBType", parent=styles["cell"], alignment=TA_LEFT)),
-            Paragraph(confidence_display, styles["cell"]),
         ])
 
-    tbl = Table(rows, colWidths=[1.4 * inch, 0.9 * inch, 3.0 * inch, 1.1 * inch])
+    tbl = Table(rows, colWidths=[1.6 * inch, 1.0 * inch, 3.8 * inch])
     row_bgs = [
         ("BACKGROUND", (0, i), (-1, i), LIGHT_BLUE_BG if i % 2 == 0 else WHITE)
         for i in range(1, len(rows))
@@ -669,18 +662,53 @@ def build_single_drug_report(stats: dict, narrative: dict, output_path: str):
     logger.info("[LOT_REPORT] Report saved -> %s", output_path)
 
 
+# ── GCS upload ────────────────────────────────────────────────────────────────
+
+def _resolve_gcs_bucket_and_prefix(location: str) -> tuple[str, str]:
+    """Splits a GCS location into (bucket, prefix).
+
+    ``location`` may be a full ``gs://bucket/prefix`` URI, or just a
+    bucket-relative prefix (e.g. ``"reports/lot"``), in which case it's
+    combined with the configured ``GCS_BUCKET``.
+    """
+    location = (location or "").strip()
+    if location.startswith("gs://"):
+        without_scheme = location[len("gs://"):]
+        bucket, _, prefix = without_scheme.partition("/")
+        return bucket, prefix.strip("/")
+    return GCS_BUCKET, location.strip("/")
+
+
+def upload_report_pdf_to_gcs(local_pdf_path: str, safe_drug_name: str) -> str:
+    """Uploads a locally-built report PDF to ``LOT_REPORT_PATH`` in GCS.
+
+    Returns the ``gs://...`` URI the report was uploaded to.
+    """
+    bucket_name, prefix = _resolve_gcs_bucket_and_prefix(LOT_REPORT_PATH)
+    blob_path = f"{prefix}/{safe_drug_name}/{REPORT_FILE_NAME}" if prefix else f"{safe_drug_name}/{REPORT_FILE_NAME}"
+
+    client = get_gcs_client()
+    bucket = client.bucket(bucket_name)
+    blob = bucket.blob(blob_path)
+    blob.upload_from_filename(local_pdf_path, content_type="application/pdf")
+
+    gcs_uri = f"gs://{bucket_name}/{blob_path}"
+    logger.info("[LOT_REPORT] Report uploaded -> %s", gcs_uri)
+    return gcs_uri
+
+
 # ── Public entry point ─────────────────────────────────────────────────────────
 
 def generate_lot_reports(drugs: list[str] | None = None) -> list[str]:
     """
-    Generate one PDF report per drug, saved to
+    Generate one PDF report per drug and upload each to GCS at
     {LOT_REPORT_PATH}/{drug_name}/Line_of_Treatment.pdf.
 
     Args:
         drugs: List of drug names to report on. None = all drugs in LOT_TABLE.
 
     Returns:
-        List of output PDF paths that were successfully created.
+        List of gs:// URIs for the reports that were successfully uploaded.
     """
     if not API_KEY:
         logger.warning("[LOT_REPORT] GEMINI_API_KEY not set — skipping report generation.")
@@ -693,7 +721,7 @@ def generate_lot_reports(drugs: list[str] | None = None) -> list[str]:
 
     grouped = group_rows_by_drug(rows)
 
-    output_paths = []
+    output_uris = []
     for drug_name, bucket in grouped.items():
         logger.info("[LOT_REPORT] Processing: %s", drug_name)
 
@@ -705,15 +733,16 @@ def generate_lot_reports(drugs: list[str] | None = None) -> list[str]:
         narrative = generate_lot_narrative(stats)
 
         safe_name = re.sub(r"[^a-zA-Z0-9_-]", "_", drug_name)
-        out_dir = Path(LOT_REPORT_PATH) / safe_name
-        out_dir.mkdir(parents=True, exist_ok=True)
-        output_path = str(out_dir / REPORT_FILE_NAME)
 
-        build_single_drug_report(stats, narrative, output_path)
-        output_paths.append(output_path)
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            local_path = str(Path(tmp_dir) / REPORT_FILE_NAME)
+            build_single_drug_report(stats, narrative, local_path)
+            gcs_uri = upload_report_pdf_to_gcs(local_path, safe_name)
 
-    logger.info("[LOT_REPORT] Done. %d report(s) generated.", len(output_paths))
-    return output_paths
+        output_uris.append(gcs_uri)
+
+    logger.info("[LOT_REPORT] Done. %d report(s) generated.", len(output_uris))
+    return output_uris
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
