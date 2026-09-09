@@ -17,13 +17,78 @@ import json
 from typing import Any
 
 from google import genai
+from google.cloud import bigquery
 from google.genai import types
 
-from medical_potential.config import GEMINI_FLASH_PREVIEW_MODEL
+from medical_potential.config import (
+    BQ_DATASET_ID,
+    GEMINI_FLASH_PREVIEW_MODEL,
+    LOT_TABLE,
+    PROJECT_ID,
+)
+from medical_potential.gcp_utils import get_bq_client
 
 logger = logging.getLogger(__name__)
 
 NOT_GENERATED_MESSAGE = "Rationale has not been generated."
+
+
+def fetch_final_lot_data(drug_name: str) -> dict[str, Any]:
+    """Fetches a drug's LOT data straight from ``LOT_TABLE`` in BigQuery.
+
+    ``(drug_name, country)`` is unique in ``LOT_TABLE`` (see
+    ``lot_scoring.push_results_to_bigquery``), so this pulls one row per
+    country for the drug directly — no extra "latest" resolution needed.
+
+    Returns a dict shaped like ``generate_lot_report.extract_drug_stats``'s
+    output:
+        {
+            "drug_name": str,
+            "final_lot_score": float | None,
+            "countries": [
+                {"country": str, "lot_score": int | None, "lot_type": str,
+                 "confidence": int | None, "rationale": str},
+                ...
+            ],
+        }
+    """
+    table_ref = f"`{PROJECT_ID}.{BQ_DATASET_ID}.{LOT_TABLE}`"
+    query = f"""
+        SELECT country, lot_score, lot_type, rationale, confidence, final_lot_score
+        FROM {table_ref}
+        WHERE drug_name = @drug_name
+        ORDER BY country
+    """
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[bigquery.ScalarQueryParameter("drug_name", "STRING", drug_name)]
+    )
+
+    bq_client = get_bq_client()
+    logger.info("[FINAL_LOT][RATIONALE] Fetching LOT data for '%s' from %s...", drug_name, LOT_TABLE)
+    rows = [dict(row) for row in bq_client.query(query, job_config=job_config).result()]
+
+    if not rows:
+        logger.warning("[FINAL_LOT][RATIONALE] No rows found in %s for '%s'.", LOT_TABLE, drug_name)
+        return {"drug_name": drug_name, "final_lot_score": None, "countries": []}
+
+    final_lot_score = None
+    countries = []
+    for row in rows:
+        if row.get("final_lot_score") is not None:
+            final_lot_score = row.get("final_lot_score")
+        countries.append({
+            "country": row.get("country"),
+            "lot_score": row.get("lot_score"),
+            "lot_type": row.get("lot_type"),
+            "confidence": row.get("confidence"),
+            "rationale": row.get("rationale") or "",
+        })
+
+    return {
+        "drug_name": drug_name,
+        "final_lot_score": final_lot_score,
+        "countries": countries,
+    }
 
 
 def _prepare_prompt_payload(data: dict[str, Any]) -> dict[str, Any]:
@@ -140,3 +205,16 @@ Strictly limit to 50 words, anything longer will be penalised
         logger.exception("[FINAL_LOT][RATIONALE] Prompt generation failed; rationale was not generated.")
 
     return NOT_GENERATED_MESSAGE, payload
+
+
+async def generate_final_lot_rationale_for_drug(
+    drug_name: str,
+    model_name: str = GEMINI_FLASH_PREVIEW_MODEL,
+) -> tuple[str, dict[str, Any]]:
+    """Fetches ``drug_name``'s data from ``LOT_TABLE`` and generates its rationale.
+
+    Convenience wrapper around ``fetch_final_lot_data`` +
+    ``generate_final_lot_rationale`` for callers that just have a drug name.
+    """
+    data = fetch_final_lot_data(drug_name)
+    return await generate_final_lot_rationale(data, model_name=model_name)
