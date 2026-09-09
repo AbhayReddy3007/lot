@@ -4,8 +4,10 @@ Mirrors the style of the serious-safety-profile rationale generator: reduce
 the scored data down to the minimal fields needed, hand them to Gemini, and
 return a short plain-text rationale plus the payload that was sent.
 
-Place this module alongside ``lot_scoring.py`` and ``generate_lot_report.py``
-at ``medical_potential/line_of_treatment/generate_rationale.py``.
+Place this module alongside ``generate_lot_report.py`` at
+``medical_potential/line_of_treatment/generate_report_and_rationale/generate_rationale.py``.
+That subfolder needs its own ``__init__.py`` so it's importable as
+``medical_potential.line_of_treatment.generate_report_and_rationale``.
 """
 
 from __future__ import annotations
