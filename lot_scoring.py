@@ -13,11 +13,13 @@ final_lot_score is a per-drug aggregate across all countries, NOT a per-row
 value: (US lot_score x US_WEIGHT) + OTHER_COUNTRY_WEIGHT x sum(lot_score for
 every other country). It is repeated on every row for that drug.
 
-SoC benchmark extraction (the PDF-read + Gemini-extraction step) is cached to
-GCS as JSON under ``gs://GCS_BUCKET/{LOT_BENCHMARK_PATH}/``, one blob per
-country. On subsequent runs, if a cached benchmark blob already exists for a
-country, the PDFs are not re-read and the benchmark is not re-generated — the
-cached benchmark text is reused directly for the overlay analysis.
+SoC benchmark extraction (the PDF-read + Gemini-extraction step) always runs
+fresh, every run — PDFs are re-read and the benchmark is re-generated every
+time, matching l.py. The resulting benchmark is also rendered as a Word
+document (like l.py's DOCX output) and saved to
+``gs://GCS_BUCKET/{LOT_BENCHMARK_PATH}/docs/``, one file per country. The
+overlay/classification step runs against the text read back from that
+generated document, not the raw in-memory string.
 
 The entry point (``main()``) lives in ``line_of_treatment.py``, which imports
 everything it needs from this module.
@@ -55,7 +57,7 @@ scripts (U2.py / lot.py) rather than from config.py.
 
 from __future__ import annotations
 
-import json
+import io
 import logging
 import os
 import re
@@ -64,6 +66,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 import fitz  # PyMuPDF
+from docx import Document
 from dotenv import load_dotenv
 from google import genai
 from google.cloud import bigquery
@@ -241,65 +244,106 @@ def extract_country_pdfs_text_gcs(blob_names: list[str]) -> str:
 
 
 # ==============================
-# BENCHMARK CACHE (GCS JSON, one blob per country)
+# SOC BENCHMARK DOCX (generated fresh every run, then read back for
+# classification — mirrors l.py's DOCX output instead of silently reusing a
+# stale JSON cache across runs, which was the root cause of LOT
+# classifications drifting from l.py's)
 # ==============================
 def _slugify_country(country: str) -> str:
     slug = re.sub(r"[^a-z0-9]+", "_", country.strip().lower())
     return slug.strip("_") or "unknown_country"
 
 
-def get_benchmark_cache_blob_name(country: str) -> str:
-    """Returns the GCS blob name (path within GCS_BUCKET) for a country's cached benchmark."""
+def add_soc_benchmark_section(doc: Document, text: str) -> None:
+    """Renders the extracted SoC benchmark text into the Word document.
+
+    Mirrors l.py's add_formatted_section, scoped to the SoC benchmark
+    portion only (no per-drug classification content exists yet at this
+    point — that's produced afterwards, from this document's text).
+    """
+    for line in text.split("\n"):
+        line = clean_text(line)
+        if not line:
+            continue
+        line_lower = line.lower()
+
+        if line.startswith("Country:"):
+            doc.add_heading(line, level=1)
+        elif line in ["1L:", "2L:", "3L:", "Salvage:"]:
+            doc.add_heading(line.replace(":", ""), level=2)
+        elif (
+            line_lower.startswith("recommended therapies")
+            or line_lower.startswith("patient segment")
+            or line_lower.startswith("treatment goal")
+        ):
+            p = doc.add_paragraph()
+            run = p.add_run(line)
+            run.bold = True
+        elif line.startswith("-"):
+            doc.add_paragraph(line[1:].strip(), style="List Bullet")
+        else:
+            doc.add_paragraph(line)
+
+
+def build_soc_benchmark_docx_bytes(country: str, soc_output: str) -> bytes:
+    """Builds a Word document for the country's SoC benchmark, formatted like l.py's DOCX output."""
+    doc = Document()
+    doc.add_heading(f"{country} — Country-Level SoC LOT Benchmark", level=1)
+    add_soc_benchmark_section(doc, soc_output)
+    buf = io.BytesIO()
+    doc.save(buf)
+    return buf.getvalue()
+
+
+def get_soc_benchmark_docx_blob_name(country: str) -> str:
+    """Returns the GCS blob name (path within GCS_BUCKET) for a country's SoC benchmark DOCX."""
     base = LOT_BENCHMARK_PATH.strip("/")
-    return f"{base}/{_slugify_country(country)}.json"
+    return f"{base}/docs/{_slugify_country(country)}.docx"
 
 
-def load_cached_benchmark(country: str) -> str | None:
-    """Returns the cached SoC benchmark text for a country, or None if absent.
+def save_soc_benchmark_docx(country: str, soc_output: str) -> str:
+    """Writes the SoC benchmark as a Word document to GCS. Returns the blob name.
 
-    Reads from gs://GCS_BUCKET/{LOT_BENCHMARK_PATH}/{country_slug}.json.
+    This always overwrites any previous document for the country — the DOCX
+    is a record of the current run's benchmark, not a cache to short-circuit
+    future runs.
     """
-    blob_name = get_benchmark_cache_blob_name(country)
+    blob_name = get_soc_benchmark_docx_blob_name(country)
     gcs_uri = f"gs://{GCS_BUCKET}/{blob_name}"
-    try:
-        gcs_client = get_gcs_client()
-        bucket = gcs_client.bucket(GCS_BUCKET)
-        blob = bucket.blob(blob_name)
-        if not blob.exists():
-            return None
-        payload = json.loads(blob.download_as_text())
-        soc_output = payload.get("soc_output")
-        if soc_output:
-            logger.info("[SOC_LOT] Using cached benchmark for '%s': %s", country, gcs_uri)
-            return soc_output
-    except Exception:
-        logger.exception("[SOC_LOT] Failed to read cached benchmark for '%s' at %s", country, gcs_uri)
-    return None
-
-
-def save_benchmark_to_cache(country: str, soc_output: str) -> None:
-    """Writes the SoC benchmark text for a country to the GCS JSON cache.
-
-    Writes to gs://GCS_BUCKET/{LOT_BENCHMARK_PATH}/{country_slug}.json.
-    """
-    blob_name = get_benchmark_cache_blob_name(country)
-    gcs_uri = f"gs://{GCS_BUCKET}/{blob_name}"
-    payload = {
-        "country": country,
-        "soc_output": soc_output,
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-    }
+    docx_bytes = build_soc_benchmark_docx_bytes(country, soc_output)
     try:
         gcs_client = get_gcs_client()
         bucket = gcs_client.bucket(GCS_BUCKET)
         blob = bucket.blob(blob_name)
         blob.upload_from_string(
-            json.dumps(payload, indent=2, ensure_ascii=False),
-            content_type="application/json",
+            docx_bytes,
+            content_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         )
-        logger.info("[SOC_LOT] Cached benchmark for '%s' at %s", country, gcs_uri)
+        logger.info("[SOC_LOT] Saved SoC benchmark DOCX for '%s' to %s", country, gcs_uri)
     except Exception:
-        logger.exception("[SOC_LOT] Failed to cache benchmark for '%s' at %s", country, gcs_uri)
+        logger.exception("[SOC_LOT] Failed to save SoC benchmark DOCX for '%s' to %s", country, gcs_uri)
+    return blob_name
+
+
+def extract_text_from_docx_bytes(docx_bytes: bytes) -> str:
+    """Reads back the plain text content of a generated SoC benchmark DOCX, one paragraph per line."""
+    doc = Document(io.BytesIO(docx_bytes))
+    return "\n".join(p.text for p in doc.paragraphs)
+
+
+def load_soc_benchmark_from_docx(country: str, docx_bytes: bytes | None = None) -> str:
+    """Returns the SoC benchmark text read back from the country's DOCX.
+
+    If docx_bytes isn't passed in (e.g. right after saving), it's downloaded
+    from GCS first.
+    """
+    if docx_bytes is None:
+        blob_name = get_soc_benchmark_docx_blob_name(country)
+        gcs_client = get_gcs_client()
+        bucket = gcs_client.bucket(GCS_BUCKET)
+        blob = bucket.blob(blob_name)
+        docx_bytes = blob.download_as_bytes()
+    return extract_text_from_docx_bytes(docx_bytes)
 
 
 # ==============================
@@ -577,16 +621,18 @@ class LotRow:
 
 
 def get_or_build_soc_benchmark(country: str, blob_names: list[str]) -> str:
-    """Returns the SoC benchmark text for a country, using the local cache when present.
+    """Builds the SoC benchmark for a country fresh, generates a Word document
+    for it (like l.py does), and returns the text read back from that
+    document — this is what the overlay/classification step runs against.
 
-    Only reads PDFs from GCS and calls Gemini for extraction when no cached
-    benchmark JSON blob exists yet for this country under
-    gs://GCS_BUCKET/{LOT_BENCHMARK_PATH}/.
+    PDFs are always re-read and re-extracted on every run; there is no
+    silent cache short-circuit here. A previous version of this function
+    reused a cached JSON benchmark blob whenever one already existed for the
+    country, which meant classification could silently run against a stale
+    benchmark from an earlier run even when the PDFs had since changed —
+    diverging from l.py, which always extracts fresh. That behavior has been
+    removed.
     """
-    cached = load_cached_benchmark(country)
-    if cached is not None:
-        return cached
-
     n_pdfs = len(blob_names)
     logger.info("[SOC_LOT] Reading %d PDF(s) from GCS for '%s'...", n_pdfs, country)
     pdf_text = extract_country_pdfs_text_gcs(blob_names)
@@ -594,8 +640,14 @@ def get_or_build_soc_benchmark(country: str, blob_names: list[str]) -> str:
     logger.info("[SOC_LOT] Extracting SoC benchmark for '%s'...", country)
     soc_output = run_soc_extraction(pdf_text, country)
 
-    save_benchmark_to_cache(country, soc_output)
-    return soc_output
+    logger.info("[SOC_LOT] Generating SoC benchmark DOCX for '%s'...", country)
+    docx_bytes = build_soc_benchmark_docx_bytes(country, soc_output)
+    save_soc_benchmark_docx(country, soc_output)
+
+    # Classify against the text read back from the generated document itself
+    # (not the raw in-memory string) so classification is always based on
+    # the doc — matching l.py's document-centric flow.
+    return load_soc_benchmark_from_docx(country, docx_bytes=docx_bytes)
 
 
 def process_country(country: str, blob_names: list[str], drugs: list[str], overlay_prompt: str) -> list[LotRow]:
