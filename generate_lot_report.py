@@ -35,6 +35,11 @@ Usage:
 
     # Two drugs — two separate PDFs
     python generate_lot_report.py --drug "Semaglutide,Tirzepatide"
+
+Place this module, together with ``generate_rationale.py``, in
+``medical_potential/line_of_treatment/generate_report_and_rationale/``. That
+subfolder needs its own ``__init__.py`` so it's importable as
+``medical_potential.line_of_treatment.generate_report_and_rationale``.
 """
 
 import os
