@@ -1,31 +1,194 @@
-Traceback (most recent call last):
-  File "<frozen runpy>", line 198, in _run_module_as_main
-  File "<frozen runpy>", line 88, in _run_code
-  File "C:\Users\P90022569\Downloads\clinical_efficacy\drl-cognito-ai\medical_potential\line_of_treatment\line_of_treatment.py", line 118, in <module>
-    main()
-  File "C:\Users\P90022569\Downloads\clinical_efficacy\drl-cognito-ai\medical_potential\line_of_treatment\line_of_treatment.py", line 111, in main
-    run_scoring()
-  File "C:\Users\P90022569\Downloads\clinical_efficacy\drl-cognito-ai\medical_potential\line_of_treatment\line_of_treatment.py", line 83, in run_scoring
-    push_results_to_bigquery(all_rows)
-  File "C:\Users\P90022569\Downloads\clinical_efficacy\drl-cognito-ai\medical_potential\line_of_treatment\lot_scoring.py", line 767, in push_results_to_bigquery
-    query_job.result()
-  File "C:\Users\P90022569\.conda\envs\cognito\Lib\site-packages\google\cloud\bigquery\job\query.py", line 1773, in result
-    while not is_job_done():
-              ^^^^^^^^^^^^^
-  File "C:\Users\P90022569\.conda\envs\cognito\Lib\site-packages\google\api_core\retry\retry_unary.py", line 294, in retry_wrapped_func
-    return retry_target(
-           ^^^^^^^^^^^^^
-  File "C:\Users\P90022569\.conda\envs\cognito\Lib\site-packages\google\api_core\retry\retry_unary.py", line 156, in retry_target
-    next_sleep = _retry_error_helper(
-                 ^^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\P90022569\.conda\envs\cognito\Lib\site-packages\google\api_core\retry\retry_base.py", line 214, in _retry_error_helper
-    raise final_exc from source_exc
-  File "C:\Users\P90022569\.conda\envs\cognito\Lib\site-packages\google\api_core\retry\retry_unary.py", line 147, in retry_target
-    result = target()
-             ^^^^^^^^
-  File "C:\Users\P90022569\.conda\envs\cognito\Lib\site-packages\google\cloud\bigquery\job\query.py", line 1722, in is_job_done
-    raise job_failed_exception
-google.api_core.exceptions.BadRequest: 400 Unrecognized name: updated_at at [12:17]; reason: invalidQuery, location: query, message: Unrecognized name: updated_at at [12:17]
+US — Country-Level SoC LOT Benchmark
+Country: US
+Country-Level SoC LOT Benchmark
+1L
+Recommended therapies/interventions:
+Lifestyle Management: Medical Nutrition Therapy (MNT), physical activity (e.g., ≥150 minutes/week moderate-intensity aerobic activity, 2-3 sessions/week resistance exercise), behavioral therapy (e.g., ≥16 sessions in 6 months, 500-750 kcal/day energy deficit), and sleep health.
+Pharmacotherapy for Type 2 Diabetes Mellitus (T2DM): Metformin.
+Pharmacotherapy for Prediabetes at high risk of T2DM: Metformin (especially for ages 25–59 years with BMI ≥35 kg/m2, fasting plasma glucose ≥110 mg/dL, A1C ≥6.0%, or prior gestational diabetes mellitus).
+Pharmacotherapy for Obesity/Weight Management: Orlistat (if BMI ≥30 kg/m2 or ≥27 kg/m2 with one or more obesity-associated comorbid conditions).
+Patient segment or trigger:
+T2DM: Newly diagnosed adults with type 2 diabetes.
+Prediabetes: Adults at high risk of type 2 diabetes (e.g., BMI ≥25 kg/m2 or ≥23 kg/m2 in individuals of Asian ancestry, one or more risk factors, A1C 5.7–6.4%, impaired glucose tolerance, or impaired fasting glucose).
+Obesity/Weight Management: Adults with overweight or obesity (BMI ≥25 kg/m2 or ≥23 kg/m2 in individuals of Asian ancestry) with or without T2DM.
+Treatment goal or rationale:
+Achieve and maintain individualized glycemic goals (e.g., A1C <7.0% for many nonpregnant adults).
+Achieve and maintain weight reduction (at least 3–7% weight loss for T2DM prevention/improvement; any magnitude for T2DM treatment).
+Improve cardiovascular, kidney, and other relevant outcomes.
+Reduce hypoglycemia risk.
+Address cost, access, tolerability, and individual preferences.
+Delay or prevent progression from prediabetes to T2DM.
+2L
+Recommended therapies/interventions:
+For T2DM with established Atherosclerotic Cardiovascular Disease (ASCVD) or high risk of ASCVD:
+Glucagon-Like Peptide 1 (GLP-1) Receptor Agonist (e.g., dulaglutide, liraglutide, semaglutide)
+Sodium-Glucose Cotransporter 2 (SGLT2) Inhibitor (e.g., canagliflozin, dapagliflozin, empagliflozin, ertugliflozin)
+For T2DM with Heart Failure (with either reduced or preserved ejection fraction):
+SGLT2 Inhibitor (e.g., canagliflozin, dapagliflozin, empagliflozin, ertugliflozin, sotagliflozin)
+For T2DM with Chronic Kidney Disease (CKD) (eGFR 20–60 mL/min/1.73 m2 and/or albuminuria):
+SGLT2 Inhibitor (e.g., canagliflozin, dapagliflozin, empagliflozin, ertugliflozin)
+GLP-1 Receptor Agonist (e.g., dulaglutide, liraglutide, semaglutide)
+For T2DM with Metabolic Dysfunction–Associated Steatotic Liver Disease (MASLD) or Metabolic Dysfunction–Associated Steatohepatitis (MASH) and overweight or obesity:
+GLP-1 Receptor Agonist (e.g., semaglutide, liraglutide)
+Dual Glucose-Dependent Insulinotropic Polypeptide (GIP) and GLP-1 Receptor Agonist (e.g., tirzepatide)
+Pioglitazone
+For Obesity/Weight Management (if lifestyle interventions are insufficient):
+GLP-1 Receptor Agonist (e.g., liraglutide, semaglutide)
+Dual GIP and GLP-1 Receptor Agonist (e.g., tirzepatide)
+Phentermine/topiramate extended-release
+Naltrexone/bupropion extended-release
+Patient segment or trigger:
+A1C above individualized target on 1L therapy.
+Presence of established ASCVD or high risk of ASCVD.
+Presence of Heart Failure (with either reduced or preserved ejection fraction).
+Presence of CKD (eGFR 20–60 mL/min/1.73 m2 and/or albuminuria).
+Presence of MASLD/MASH with overweight or obesity.
+Obesity/Overweight with insufficient weight loss from lifestyle interventions.
+Treatment goal or rationale:
+Further reduce A1C to individualized target.
+Reduce cardiovascular events (Major Adverse Cardiovascular Events [MACE], Heart Failure hospitalization).
+Slow progression of CKD.
+Improve MASLD/MASH histology.
+Achieve greater weight loss (typically >10% for obesity pharmacotherapy).
+Minimize hypoglycemia risk.
+3L
+Recommended therapies/interventions:
+For T2DM with ASCVD/HF/CKD (if not already on both SGLT2i and GLP-1 RA):
+Combination of SGLT2 Inhibitor + GLP-1 Receptor Agonist (or dual GIP/GLP-1 Receptor Agonist).
+For T2DM with CKD and albuminuria (on ACE inhibitor/ARB):
+Nonsteroidal Mineralocorticoid Receptor Antagonist (e.g., finerenone).
+For T2DM with MASLD/MASH (biopsy-proven or high risk of fibrosis):
+Combination therapy with pioglitazone + GLP-1 Receptor Agonist.
+Thyroid hormone receptor-β agonist (e.g., resmetirom) for MASLD with moderate (F2) or advanced (F3) liver fibrosis (requires specialist referral for initiation).
+For T2DM requiring further glycemic control (if non-insulin agents maximized):
+Basal insulin (often in combination with GLP-1 Receptor Agonist or dual GIP/GLP-1 Receptor Agonist).
+For Obesity/Weight Management (if pharmacotherapy is insufficient):
+Metabolic surgery (e.g., Roux-en-Y gastric bypass, vertical sleeve gastrectomy).
+Patient segment or trigger:
+A1C still above individualized target on 2L therapy.
+Need for additive cardiovascular and kidney risk reduction.
+CKD with albuminuria despite ACE inhibitor/ARB.
+Biopsy-proven MASH or high risk of liver fibrosis.
+Persistent hyperglycemia despite maximized non-insulin therapies.
+Adolescents with type 2 diabetes who have class 2 obesity or higher (BMI >35 kg/m2 or >120% of 95th percentile for age and sex) and who have elevated A1C and/or serious comorbidities despite lifestyle and pharmacologic intervention.
+Adults with BMI ≥30.0 kg/m2 (or ≥27.5 kg/m2 in individuals of Asian ancestry) with T2DM who are otherwise good surgical candidates.
+Treatment goal or rationale:
+Achieve and maintain individualized glycemic goals.
+Maximize cardiovascular and kidney protection.
+Achieve MASH resolution and/or fibrosis improvement.
+Achieve significant and durable weight loss, potentially leading to diabetes remission.
+Prevent acute complications (e.g., DKA, severe hyperglycemia).
+Salvage
+Recommended therapies/interventions:
+Intensified Insulin Regimens: Basal-bolus insulin therapy.
+Advanced Diabetes Technology: Automated Insulin Delivery (AID) systems (for type 1 diabetes, and increasingly for type 2 diabetes).
+Metabolic Surgery: For individuals with severe obesity and T2DM not achieving goals with other therapies.
+Management of Hyperglycemic Crises: Intravenous fluids, insulin, and electrolytes for Diabetic Ketoacidosis (DKA) and/or Hyperglycemic Hyperosmolar State (HHS).
+De-intensification/Simplification: For older adults or those with limited life expectancy, high hypoglycemia risk, or high treatment burden, simplify complex regimens (e.g., fewer injections, fewer monitoring tasks, discontinuation of certain agents).
+Patient segment or trigger:
+Persistent severe hyperglycemia (A1C >10% or blood glucose ≥300 mg/dL) or symptomatic hyperglycemia despite multiple agents.
+Recurrent DKA or HHS.
+High risk of hypoglycemia or hypoglycemia unawareness.
+Significant treatment burden or declining functional/cognitive status (especially in older adults).
+Failure to achieve weight or glycemic goals with less invasive interventions.
+Treatment goal or rationale:
+Achieve and maintain glycemic control to prevent acute complications.
+Minimize hypoglycemia and treatment burden.
+Improve quality of life.
+Address complex and advanced disease states.
+Therapy Classes Explicitly Mentioned:
+Metformin (Biguanides)
+Sulfonylureas (e.g., Glimepiride, Glipizide, Glyburide)
+Thiazolidinediones (e.g., Pioglitazone)
+Alpha-Glucosidase Inhibitors (e.g., Acarbose, Miglitol)
+Meglitinides (e.g., Nateglinide, Repaglinide)
+Dipeptidyl Peptidase 4 (DPP-4) Inhibitors (e.g., Alogliptin, Linagliptin, Saxagliptin, Sitagliptin)
+Sodium-Glucose Cotransporter 2 (SGLT2) Inhibitors (e.g., Bexagliflozin, Canagliflozin, Dapagliflozin, Empagliflozin, Ertugliflozin)
+Glucagon-Like Peptide 1 (GLP-1) Receptor Agonists (e.g., Dulaglutide, Exenatide, Liraglutide, Semaglutide)
+Dual Glucose-Dependent Insulinotropic Polypeptide (GIP) and Glucagon-Like Peptide 1 (GLP-1) Receptor Agonists (e.g., Tirzepatide)
+Bile Acid Sequestrants (e.g., Colesevelam)
+Dopamine-2 Agonists (e.g., Bromocriptine)
+Amylin Mimetics (e.g., Pramlintide)
+Insulin (e.g., Human Regular, NPH; Analogs: Aspart, Glulisine, Lispro, Degludec, Glargine; Ultra-rapid-acting analogs; Inhaled human insulin; Concentrated insulins; Premixed insulins)
+Angiotensin-Converting Enzyme (ACE) Inhibitors
+Angiotensin Receptor Blockers (ARBs)
+Thiazide-like Diuretics (e.g., Chlorthalidone, Indapamide)
+Dihydropyridine Calcium Channel Blockers
+Beta-blockers
+Mineralocorticoid Receptor Antagonists (MRAs) (e.g., Spironolactone, Eplerenone)
+Nonsteroidal Mineralocorticoid Receptor Antagonists (e.g., Finerenone)
+Antiplatelet Agents (e.g., Aspirin, Clopidogrel, Ticagrelor, Prasugrel)
+Anticoagulants (e.g., Rivaroxaban)
+PCSK9 Inhibitors (e.g., Alirocumab, Evolocumab, Inclisiran)
+Bempedoic Acid
+Thyroid Hormone Receptor-β Agonist (e.g., Resmetirom)
+Phentermine (Sympathomimetic amine anorectic)
+Phentermine/Topiramate ER (Sympathomimetic amine anorectic/antiepileptic combination)
+Naltrexone/Bupropion ER (Opioid antagonist/antidepressant combination)
+Orlistat (Lipase inhibitor)
+Setmelanotide (Melanocortin 4 receptor agonist)
+Icosapent Ethyl (n-3 fatty acid)
+Fibrates (e.g., Fenofibrate, Gemfibrozil, Pemafibrate)
+Niacin
+Gabapentinoids (e.g., Pregabalin, Gabapentin, Mirogabalin)
+Serotonin-Norepinephrine Reuptake Inhibitors (SNRIs) (e.g., Duloxetine, Venlafaxine, Desvenlafaxine)
+Tricyclic Antidepressants (TCAs) (e.g., Amitriptyline)
+Sodium Channel Blockers (e.g., Lamotrigine, Lacosamide, Carbamazepine, Oxcarbazepine, Valproic acid)
+Capsaicin (Topical)
+Lidocaine (Topical)
+Midodrine (Alpha-1 adrenergic agonist)
+Droxidopa (Alpha-1 adrenergic agonist)
+Metoclopramide (Prokinetic agent)
+Erythromycin (Prokinetic agent)
+ 
+Semaglutide LOT Classification — US
+Molecule: Semaglutide
+MOA: Glucagon Like Peptide 1 Receptor Agonist
+Final LoT Category: Second-line option
+Rationale: The molecule Semaglutide is a Glucagon Like Peptide 1 Receptor Agonist (GLP-1 RA). According to the provided Country-Level SoC LOT Benchmark, GLP-1 Receptor Agonists are not listed in the First-Line (1L) recommended therapies. They are explicitly introduced in the Second-Line (2L) section.
+In the 2L section, GLP-1 Receptor Agonists (with Semaglutide specifically listed as an example) are recommended for several patient segments, including:
+•	For T2DM with established Atherosclerotic Cardiovascular Disease (ASCVD) or high risk of ASCVD.
+•	For T2DM with Chronic Kidney Disease (CKD).
+•	For T2DM with Metabolic Dysfunction–Associated Steatotic Liver Disease (MASLD) or Metabolic Dysfunction–Associated Steatohepatitis (MASH) and overweight or obesity.
+•	For Obesity/Weight Management (if lifestyle interventions are insufficient).
+The 2L patient segment triggers also include "A1C above individualized target on 1L therapy," indicating its role as an escalation or add-on therapy after 1L. While GLP-1 Receptor Agonists are also mentioned in 3L as part of combination therapies, their earliest explicit recommendation as a therapy class is in the 2L. Following the rule to assign the earliest applicable line, Semaglutide is classified as a Second-line option.
 
-Location: asia-south1
-Job ID: 473fcc58-a3ca-4478-bd5d-0ac3ab318623
+
+US — Country-Level SoC LOT Benchmark
+Country: US
+Country-Level SoC LOT Benchmark
+1L
+Recommended therapies/interventions: Healthy behavior change (nutrition and physical activity), Diabetes Self-Management Education and Support (DSMES), and Metformin. For individuals with established or high risk of atherosclerotic cardiovascular disease (ASCVD), heart failure (HF), or chronic kidney disease (CKD), an SGLT2 inhibitor or GLP-1 receptor agonist with demonstrated beneﬁt is recommended as initial therapy irrespective of A1C or metformin use. For obesity management, intensive lifestyle intervention and/or weight management pharmacotherapy (specifically semaglutide or tirzepatide) are recommended.
+Patient segment or trigger: Newly diagnosed Type 2 Diabetes Mellitus (T2DM), individuals with prediabetes, or individuals with overweight/obesity (BMI ≥27 kg/m2 with comorbidities or ≥30 kg/m2).
+Treatment goal or rationale: To achieve individualized glycemic and weight goals, reduce cardiovascular and kidney risk, and prevent complications.
+2L
+Recommended therapies/interventions: Addition of a second glucose-lowering agent. Priority is given to SGLT2 inhibitors, GLP-1 receptor agonists, or dual GIP and GLP-1 receptor agonists based on the presence of ASCVD, HF, CKD, or the need for weight management. Other options include DPP-4 inhibitors, thiazolidinediones (TZD), or basal insulin. For obesity, intensiﬁcation of pharmacotherapy or transition to higher-efﬁcacy agents.
+Patient segment or trigger: Individuals not meeting individualized A1C or weight goals after 3 to 6 months of first-line therapy.
+Treatment goal or rationale: To overcome therapeutic inertia and address specific comorbidities or weight goals.
+3L
+Recommended therapies/interventions: Intensiﬁcation to injectable therapies. GLP-1 receptor agonists or dual GIP and GLP-1 receptor agonists are preferred over insulin for most adults without evidence of insulin deﬁciency. If insulin is required, basal insulin is typically initiated and titrated, often in combination with a GLP-1 receptor agonist or dual GIP and GLP-1 receptor agonist.
+Patient segment or trigger: Individuals with persistent hyperglycemia or those not meeting goals on dual or triple oral/injectable therapy.
+Treatment goal or rationale: To provide high-efﬁcacy glucose lowering while minimizing hypoglycemia and weight gain.
+Salvage
+Recommended therapies/interventions: Metabolic surgery, automated insulin delivery (AID) systems, or complex insulin plans (basal-bolus). Concentrated insulins (e.g., U-500 regular) may be used for severe insulin resistance.
+Patient segment or trigger: Individuals with BMI ≥30 kg/m2 (or ≥27.5 kg/m2 in Asian Americans) who are surgical candidates, or those with absolute insulin deﬁciency/advanced disease requiring intensive management.
+Treatment goal or rationale: To achieve glycemic stability, induce diabetes remission, and improve quality of life in advanced or refractory cases.
+Therapy Classes Explicitly Mentioned:
+•	Biguanides (Metformin)
+•	SGLT2 inhibitors (Canagliﬂozin, Dapagliﬂozin, Empagliﬂozin, Ertugliﬂozin)
+•	SGLT1/2 inhibitors (Sotagliﬂozin)
+•	GLP-1 receptor agonists (Liraglutide, Semaglutide, Dulaglutide, Exenatide, Albiglutide, Lixisenatide)
+•	Dual GIP and GLP-1 receptor agonists (Tirzepatide)
+•	DPP-4 inhibitors (Sitagliptin, Saxagliptin, Linagliptin, Alogliptin)
+•	Thiazolidinediones (Pioglitazone, Rosiglitazone)
+•	Sulfonylureas (Glimepiride, Glipizide, Glyburide)
+•	Meglitinides (Repaglinide, Nateglinide)
+•	Insulin (Basal analogs, NPH, Regular, Rapid-acting analogs, Ultra-rapid-acting analogs, Inhaled, Concentrated)
+•	Amylin mimetics (Pramlintide)
+•	Alpha-glucosidase inhibitors (Acarbose, Miglitol)
+•	Bile acid sequestrants (Colesevelam)
+•	Dopamine-2 agonists (Bromocriptine)
+•	Weight management combinations (Phentermine/Topiramate, Naltrexone/Bupropion)
+•	Lipase inhibitors (Orlistat)
+•	Nonsteroidal mineralocorticoid receptor antagonists (Finerenone)
+
