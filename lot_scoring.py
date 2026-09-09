@@ -1,31 +1,26 @@
 """SoC → Lines-of-Therapy (LOT) scoring — core logic.
 
 Reads country-level Standard-of-Care (SoC) PDFs from GCS (one subfolder per
-country under ``GCS_SOC_BASE_PATH``), looks up the drug's Mechanism of
+country under ``GCS_SOC_BASE_PATH``), looks up each drug's Mechanism of
 Action (MOA) from the BigQuery MOA lookup table, asks Gemini to (1) extract a
-per-country SoC LOT benchmark (1st Line / 2nd Line / Other) and (2) rank the
-drug against that benchmark to decide which line it belongs to, then pushes
-one row per country to BigQuery:
+per-country SoC LOT benchmark and (2) classify each supplied drug against
+that benchmark, then pushes one row per drug/country combination to
+BigQuery:
 
     drug_name, country, lot_score, lot_type, rationale, confidence, final_lot_score
-
-lot_type is one of "1st Line", "2nd Line", "Other" (Other covers third-line,
-restricted-use, and salvage/last-resort use). lot_score is the corresponding
-numeric rank: 1st Line = 3, 2nd Line = 2, Other = 1.
 
 final_lot_score is a per-drug aggregate across all countries, NOT a per-row
 value: (US lot_score x US_WEIGHT) + OTHER_COUNTRY_WEIGHT x sum(lot_score for
 every other country). It is repeated on every row for that drug.
 
 SoC benchmark extraction (the PDF-read + Gemini-extraction step) is cached to
-GCS as a Word document (.docx) under ``gs://GCS_BUCKET/{LOT_BENCHMARK_PATH}/``,
-one document per country, with a section for 1st Line, 2nd Line, and Other.
-On subsequent runs, if a cached benchmark document already exists for a
+GCS as JSON under ``gs://GCS_BUCKET/{LOT_BENCHMARK_PATH}/``, one blob per
+country. On subsequent runs, if a cached benchmark blob already exists for a
 country, the PDFs are not re-read and the benchmark is not re-generated — the
-cached document is downloaded and reused directly for the ranking step.
+cached benchmark text is reused directly for the overlay analysis.
 
-The entry point (``line_of_treatment()``) lives in ``line_of_treatment.py``,
-which imports everything it needs from this module.
+The entry point (``main()``) lives in ``line_of_treatment.py``, which imports
+everything it needs from this module.
 
 Place these modules at ``medical_potential/lot_scoring.py`` and
 ``medical_potential/line_of_treatment.py`` so they can reuse
@@ -43,12 +38,12 @@ Add the following to ``medical_potential/config.py`` (they do not exist yet):
                                 #   contains one subfolder per country, each holding
                                 #   that country's SoC PDF(s)
     GEMINI_FLASH_PREVIEW_MODEL  # e.g. "gemini-2.5-flash" — Gemini model used for
-                                #   both SoC extraction and the ranking step
+                                #   both SoC extraction and overlay analysis
     US_WEIGHT                   # e.g. 0.58 — weight applied to the US lot_score
     OTHER_COUNTRY_WEIGHT        # e.g. 0.14 — weight applied to each non-US lot_score
     LOT_TABLE                   # BQ table results are pushed to, e.g. "soc_lot_scores"
     LOT_BENCHMARK_PATH          # GCS prefix (under GCS_BUCKET) where per-country
-                                #   SoC benchmark .docx cache files are read from /
+                                #   SoC benchmark JSON cache blobs are read from /
                                 #   written to, e.g. "lot_benchmarks"
 
 PROJECT_ID and BQ_DATASET_ID are reused as-is (both for the MOA lookup table
@@ -60,7 +55,7 @@ scripts (U2.py / lot.py) rather than from config.py.
 
 from __future__ import annotations
 
-import io
+import json
 import logging
 import os
 import re
@@ -69,7 +64,6 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 import fitz  # PyMuPDF
-from docx import Document
 from dotenv import load_dotenv
 from google import genai
 from google.cloud import bigquery
@@ -103,24 +97,26 @@ client = genai.Client(api_key=GEMINI_API_KEY)
 # ==============================
 # CONFIG / CONSTANTS
 # ==============================
-# LOT line -> numeric rank score. "Other" folds in third-line, restricted-use,
-# and salvage/last-resort use.
-LOT_LINES: list[str] = ["1st Line", "2nd Line", "Other"]
-
-LOT_RANK_SCORE: dict[str, int] = {
-    "1st line": 3,
-    "2nd line": 2,
-    "other": 1,
+# LOT type -> numeric score
+LOT_SCORE_MAP: dict[str, int] = {
+    "first-line standard of care": 5,
+    "strong first-line alternative / dominant second-line": 4,
+    "second-line option": 3,
+    "third-line or restricted niche use": 2,
+    "salvage / last-resort use": 1,
 }
 
 # Fallback keyword matching, checked in order, for LOT strings that don't
-# exactly match LOT_RANK_SCORE (e.g. minor wording drift from the LLM).
+# exactly match LOT_SCORE_MAP (e.g. minor wording drift from the LLM).
 LOT_KEYWORD_FALLBACK: list[tuple[str, int]] = [
-    ("1st", 3),
-    ("first", 3),
-    ("2nd", 2),
-    ("second", 2),
-    ("other", 1),
+    ("salvage", 1),
+    ("last-resort", 1),
+    ("third-line", 2),
+    ("restricted niche", 2),
+    ("strong first-line alternative", 4),
+    ("dominant second-line", 4),
+    ("second-line", 3),
+    ("first-line", 5),
 ]
 
 US_ALIASES = {"us", "usa", "u.s.", "u.s.a.", "united states", "united_states", "united states of america"}
@@ -245,7 +241,7 @@ def extract_country_pdfs_text_gcs(blob_names: list[str]) -> str:
 
 
 # ==============================
-# BENCHMARK CACHE (GCS Word document, one .docx per country)
+# BENCHMARK CACHE (GCS JSON, one blob per country)
 # ==============================
 def _slugify_country(country: str) -> str:
     slug = re.sub(r"[^a-z0-9]+", "_", country.strip().lower())
@@ -255,73 +251,13 @@ def _slugify_country(country: str) -> str:
 def get_benchmark_cache_blob_name(country: str) -> str:
     """Returns the GCS blob name (path within GCS_BUCKET) for a country's cached benchmark."""
     base = LOT_BENCHMARK_PATH.strip("/")
-    return f"{base}/{_slugify_country(country)}.docx"
-
-
-def parse_soc_sections(soc_output: str) -> dict[str, str]:
-    """Splits the raw SoC-extraction LLM output into one text block per LOT line.
-
-    Looks for the "1st Line:" / "2nd Line:" / "Other:" headings produced by
-    SYSTEM_INSTRUCTION, plus the trailing "Therapy Classes Explicitly
-    Mentioned:" section if present.
-    """
-    headings = [*LOT_LINES, "Therapy Classes Explicitly Mentioned"]
-    positions: list[tuple[int, str]] = []
-    for heading in headings:
-        m = re.search(rf"(?im)^{re.escape(heading)}\s*:\s*$", soc_output)
-        if m:
-            positions.append((m.start(), heading))
-
-    positions.sort(key=lambda p: p[0])
-    sections: dict[str, str] = {}
-    for i, (start, heading) in enumerate(positions):
-        end = positions[i + 1][0] if i + 1 < len(positions) else len(soc_output)
-        # Drop the heading line itself, keep only the body that follows it.
-        body = soc_output[start:end].split(":", 1)
-        sections[heading] = body[1].strip() if len(body) > 1 else soc_output[start:end].strip()
-
-    return sections
-
-
-def build_benchmark_docx(country: str, soc_output: str) -> bytes:
-    """Builds a Word document (.docx) with one section per LOT line for a country."""
-    sections = parse_soc_sections(soc_output)
-
-    doc = Document()
-    doc.add_heading(f"{country} — SoC Line of Treatment Benchmark", level=1)
-
-    for line in LOT_LINES:
-        doc.add_heading(line, level=2)
-        doc.add_paragraph(sections.get(line, "").strip() or "Not specified in the source SoC document(s).")
-
-    if "Therapy Classes Explicitly Mentioned" in sections:
-        doc.add_heading("Therapy Classes Explicitly Mentioned", level=2)
-        doc.add_paragraph(sections["Therapy Classes Explicitly Mentioned"].strip())
-
-    buffer = io.BytesIO()
-    doc.save(buffer)
-    return buffer.getvalue()
-
-
-def docx_bytes_to_benchmark_text(docx_bytes: bytes) -> str:
-    """Reconstructs plain benchmark text (heading + body per LOT line) from a cached .docx."""
-    doc = Document(io.BytesIO(docx_bytes))
-    lines: list[str] = []
-    for para in doc.paragraphs:
-        text = para.text.strip()
-        if not text:
-            continue
-        if para.style.name.startswith("Heading"):
-            lines.append(f"\n{text}:")
-        else:
-            lines.append(text)
-    return "\n".join(lines).strip()
+    return f"{base}/{_slugify_country(country)}.json"
 
 
 def load_cached_benchmark(country: str) -> str | None:
     """Returns the cached SoC benchmark text for a country, or None if absent.
 
-    Reads from gs://GCS_BUCKET/{LOT_BENCHMARK_PATH}/{country_slug}.docx.
+    Reads from gs://GCS_BUCKET/{LOT_BENCHMARK_PATH}/{country_slug}.json.
     """
     blob_name = get_benchmark_cache_blob_name(country)
     gcs_uri = f"gs://{GCS_BUCKET}/{blob_name}"
@@ -331,31 +267,35 @@ def load_cached_benchmark(country: str) -> str | None:
         blob = bucket.blob(blob_name)
         if not blob.exists():
             return None
-        docx_bytes = blob.download_as_bytes()
-        benchmark_text = docx_bytes_to_benchmark_text(docx_bytes)
-        if benchmark_text:
+        payload = json.loads(blob.download_as_text())
+        soc_output = payload.get("soc_output")
+        if soc_output:
             logger.info("[SOC_LOT] Using cached benchmark for '%s': %s", country, gcs_uri)
-            return benchmark_text
+            return soc_output
     except Exception:
         logger.exception("[SOC_LOT] Failed to read cached benchmark for '%s' at %s", country, gcs_uri)
     return None
 
 
 def save_benchmark_to_cache(country: str, soc_output: str) -> None:
-    """Writes the SoC benchmark for a country to GCS as a Word document (.docx).
+    """Writes the SoC benchmark text for a country to the GCS JSON cache.
 
-    Writes to gs://GCS_BUCKET/{LOT_BENCHMARK_PATH}/{country_slug}.docx.
+    Writes to gs://GCS_BUCKET/{LOT_BENCHMARK_PATH}/{country_slug}.json.
     """
     blob_name = get_benchmark_cache_blob_name(country)
     gcs_uri = f"gs://{GCS_BUCKET}/{blob_name}"
+    payload = {
+        "country": country,
+        "soc_output": soc_output,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+    }
     try:
-        docx_bytes = build_benchmark_docx(country, soc_output)
         gcs_client = get_gcs_client()
         bucket = gcs_client.bucket(GCS_BUCKET)
         blob = bucket.blob(blob_name)
         blob.upload_from_string(
-            docx_bytes,
-            content_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            json.dumps(payload, indent=2, ensure_ascii=False),
+            content_type="application/json",
         )
         logger.info("[SOC_LOT] Cached benchmark for '%s' at %s", country, gcs_uri)
     except Exception:
@@ -384,25 +324,27 @@ NOTE:
 - You may receive text extracted from multiple SoC PDFs for the same country.
 - Synthesise all documents into a single unified LOT benchmark for that country.
 - If documents conflict, prefer the most recent or most authoritative guidance.
-- Group the benchmark into exactly three lines: "1st Line", "2nd Line", and "Other".
-  "Other" covers everything that is not clearly first-line or second-line therapy —
-  third-line, restricted/niche use, and salvage/last-resort therapies all belong here.
 
 OUTPUT FORMAT STRICT:
 Country: [Country]
 Country-Level SoC LOT Benchmark
 
-1st Line:
+1L:
 Recommended therapies/interventions:
 Patient segment or trigger:
 Treatment goal or rationale:
 
-2nd Line:
+2L:
 Recommended therapies/interventions:
 Patient segment or trigger:
 Treatment goal or rationale:
 
-Other:
+3L:
+Recommended therapies/interventions:
+Patient segment or trigger:
+Treatment goal or rationale:
+
+Salvage:
 Recommended therapies/interventions:
 Patient segment or trigger:
 Treatment goal or rationale:
@@ -420,7 +362,7 @@ FORMATTING RULES:
 
 
 # ==============================
-# RANKING PROMPT (LOT line ranking + confidence)
+# OVERLAY PROMPT (LOT classification + confidence)
 # ==============================
 def build_overlay_prompt(drugs: list[str], drug_moa: dict[str, dict]) -> str:
     molecule_lines = []
@@ -440,35 +382,36 @@ def build_overlay_prompt(drugs: list[str], drug_moa: dict[str, dict]) -> str:
     return f"""You are a Senior Market Access Analyst.
 
 Task:
-Rank each molecule below against the three-line SoC benchmark provided above (1st Line, 2nd Line, Other)
-and decide which line it belongs to, based ONLY on the supplied MOA and the SoC benchmark content —
-do not use a fixed lookup table or external scoring rubric. Reason directly from the benchmark text.
+Determine the most appropriate Line of Treatment (LOT) classification for each molecule below based ONLY on the supplied MOA and the SoC definitions provided above.
 
 Molecules and their MOA:
 {molecule_list}
 
-RANKING RULES:
+LOT ASSIGNMENT RULES:
 - Identify the pharmacologic class, therapeutic modality, or treatment approach from the MOA.
-- Compare that MOA against the therapies, mechanisms, modalities, and treatment approaches explicitly
-  described under each of the benchmark's three lines (1st Line, 2nd Line, Other).
-- Rank the molecule into the earliest line whose description matches the MOA.
-- If the MOA aligns with content in multiple lines, assign the earliest applicable line.
-- Only assign "Other" when the MOA aligns primarily with therapies described as later-line escalation,
-  restricted/niche use, rescue therapy, or last-resort intervention in the benchmark's "Other" section.
-- Do NOT use historical treatment sequencing, current prescribing patterns, external guidelines, prior
-  knowledge, or assumptions outside the supplied SoC benchmark.
-- When uncertainty exists, assign the earliest line supported by the MOA-to-benchmark mapping.
+- Match the MOA to the therapy classes, mechanisms, modalities, or treatment approaches explicitly described in the SoC.
+- Determine the earliest treatment line in which the matching therapy class, mechanism, modality, or treatment approach appears.
+- If the MOA aligns with multiple treatment lines, assign the earliest applicable line.
+- Do NOT use historical treatment sequencing, current prescribing patterns, external guidelines, prior knowledge, or assumptions outside the supplied SoC.
+- Evaluate the MOA against all SoC pathways and patient segments described in the benchmark.
+- When a therapy class, mechanism, modality, or treatment approach appears in multiple SoC pathways, prioritize the earliest treatment line in which it is explicitly recommended.
+- Only assign Second-Line when the MOA aligns primarily with therapies described as add-on, substitute, escalation, replacement, or post-failure options relative to First-Line treatment.
+- Only assign Third-Line when the MOA aligns primarily with therapies described as later-line escalation, refractory-disease management, restricted-use therapies, or options used after failure of earlier treatment lines.
+- Only assign Salvage when the MOA aligns primarily with rescue therapies, transplantation, last-resort interventions, or therapies explicitly described in the Salvage section of the SoC.
+- When uncertainty exists, assign the earliest treatment line supported by the MOA-to-SoC mapping.
 
 CLASSIFICATION OPTIONS (use this exact wording for Final LoT Category):
-- 1st Line
-- 2nd Line
-- Other
+- First-line standard of care
+- Strong first-line alternative / dominant second-line
+- Second-line option
+- Third-line or restricted niche use
+- Salvage / last-resort use
 
 CONFIDENCE:
-- For each molecule, also output a Confidence score from 0 to 100 reflecting how directly the MOA maps to explicit language in the benchmark.
-- Use a high confidence (80-100) only when the benchmark explicitly names the therapy class/mechanism under that line.
+- For each molecule, also output a Confidence score from 0 to 100 reflecting how directly the MOA maps to explicit language in the SoC.
+- Use a high confidence (80-100) only when the SoC explicitly names the therapy class/mechanism at a specific line.
 - Use a medium confidence (50-79) when the mapping is inferred from a closely related class or modality.
-- Use a low confidence (0-49) when the benchmark does not clearly address this MOA and the line was inferred indirectly.
+- Use a low confidence (0-49) when the SoC does not clearly address this MOA and the line was inferred indirectly.
 - Output Confidence as a bare integer (e.g. "82"), with no % sign or extra words.
 
 OUTPUT FORMAT (repeat exactly for every molecule, keep field labels verbatim):
@@ -583,8 +526,8 @@ def map_lot_type_to_score(lot_type: str) -> int | None:
     if not lot_type:
         return None
     normalized = lot_type.strip().lower()
-    if normalized in LOT_RANK_SCORE:
-        return LOT_RANK_SCORE[normalized]
+    if normalized in LOT_SCORE_MAP:
+        return LOT_SCORE_MAP[normalized]
     for keyword, score in LOT_KEYWORD_FALLBACK:
         if keyword in normalized:
             return score
@@ -634,10 +577,10 @@ class LotRow:
 
 
 def get_or_build_soc_benchmark(country: str, blob_names: list[str]) -> str:
-    """Returns the SoC benchmark text for a country, using the GCS cache when present.
+    """Returns the SoC benchmark text for a country, using the local cache when present.
 
     Only reads PDFs from GCS and calls Gemini for extraction when no cached
-    benchmark .docx exists yet for this country under
+    benchmark JSON blob exists yet for this country under
     gs://GCS_BUCKET/{LOT_BENCHMARK_PATH}/.
     """
     cached = load_cached_benchmark(country)
