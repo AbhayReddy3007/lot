@@ -5,9 +5,10 @@ Reads scored data from BigQuery `LOT_TABLE` (populated by
 ``line_of_treatment.py`` / ``lot_scoring.py``) and generates one professional
 PDF report **per drug** using Gemini for narrative generation.
 
-For each drug, the LATEST row per (drug_name, country) — by timestamp — is
+For each drug, the LATEST row per (drug_name, country) — by updated_at — is
 used, together with the most recently computed final_lot_score for that
-drug.
+drug. (drug_name, country) is unique in LOT_TABLE, so this is normally a
+1:1 lookup rather than a real "latest of many" pick.
 
 The report pulls ALL available fields from the LOT_TABLE (per-country
 lot_score, lot_type, rationale, confidence, and the aggregate
@@ -157,7 +158,7 @@ def load_from_bigquery(drugs: list[str] | None = None) -> list[dict]:
         WITH ranked AS (
             SELECT *,
                 ROW_NUMBER() OVER (
-                    PARTITION BY drug_name, country ORDER BY timestamp DESC
+                    PARTITION BY drug_name, country ORDER BY updated_at DESC
                 ) AS _rn
             FROM {table_ref}
             WHERE drug_name IS NOT NULL {drug_filter}
@@ -183,7 +184,7 @@ def group_rows_by_drug(rows: list[dict]) -> dict[str, dict]:
         bucket = grouped.setdefault(drug, {"countries": [], "final_lot_score": None, "_latest_ts": None})
         bucket["countries"].append(row)
 
-        ts = row.get("timestamp")
+        ts = row.get("updated_at")
         if ts is not None and (bucket["_latest_ts"] is None or ts > bucket["_latest_ts"]):
             bucket["_latest_ts"] = ts
             if row.get("final_lot_score") is not None:
