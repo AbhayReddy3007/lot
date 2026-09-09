@@ -1,0 +1,31 @@
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "C:\Users\P90022569\Downloads\clinical_efficacy\drl-cognito-ai\medical_potential\line_of_treatment\line_of_treatment.py", line 118, in <module>
+    main()
+  File "C:\Users\P90022569\Downloads\clinical_efficacy\drl-cognito-ai\medical_potential\line_of_treatment\line_of_treatment.py", line 111, in main
+    run_scoring()
+  File "C:\Users\P90022569\Downloads\clinical_efficacy\drl-cognito-ai\medical_potential\line_of_treatment\line_of_treatment.py", line 83, in run_scoring
+    push_results_to_bigquery(all_rows)
+  File "C:\Users\P90022569\Downloads\clinical_efficacy\drl-cognito-ai\medical_potential\line_of_treatment\lot_scoring.py", line 767, in push_results_to_bigquery
+    query_job.result()
+  File "C:\Users\P90022569\.conda\envs\cognito\Lib\site-packages\google\cloud\bigquery\job\query.py", line 1773, in result
+    while not is_job_done():
+              ^^^^^^^^^^^^^
+  File "C:\Users\P90022569\.conda\envs\cognito\Lib\site-packages\google\api_core\retry\retry_unary.py", line 294, in retry_wrapped_func
+    return retry_target(
+           ^^^^^^^^^^^^^
+  File "C:\Users\P90022569\.conda\envs\cognito\Lib\site-packages\google\api_core\retry\retry_unary.py", line 156, in retry_target
+    next_sleep = _retry_error_helper(
+                 ^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\P90022569\.conda\envs\cognito\Lib\site-packages\google\api_core\retry\retry_base.py", line 214, in _retry_error_helper
+    raise final_exc from source_exc
+  File "C:\Users\P90022569\.conda\envs\cognito\Lib\site-packages\google\api_core\retry\retry_unary.py", line 147, in retry_target
+    result = target()
+             ^^^^^^^^
+  File "C:\Users\P90022569\.conda\envs\cognito\Lib\site-packages\google\cloud\bigquery\job\query.py", line 1722, in is_job_done
+    raise job_failed_exception
+google.api_core.exceptions.BadRequest: 400 Unrecognized name: updated_at at [12:17]; reason: invalidQuery, location: query, message: Unrecognized name: updated_at at [12:17]
+
+Location: asia-south1
+Job ID: 473fcc58-a3ca-4478-bd5d-0ac3ab318623
