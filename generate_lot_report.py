@@ -95,18 +95,20 @@ LIGHT_GRAY = colors.HexColor("#666666")
 DIVIDER_COLOR = colors.HexColor("#D0D7E3")
 
 LOT_SCORE_COLORS = {
-    3: colors.HexColor("#008000"),
-    2: colors.HexColor("#CC9900"),
+    5: colors.HexColor("#008000"),
+    4: colors.HexColor("#4CAF50"),
+    3: colors.HexColor("#CC9900"),
+    2: colors.HexColor("#E65100"),
     1: colors.HexColor("#CC0000"),
 }
 
 LOT_SCORE_LABEL = {
-    3: "1st Line",
-    2: "2nd Line",
-    1: "Other (third-line, restricted use, or salvage/last-resort)",
+    5: "First-line standard of care",
+    4: "Strong first-line alternative / dominant second-line",
+    3: "Second-line option",
+    2: "Third-line or restricted niche use",
+    1: "Salvage / last-resort use",
 }
-
-LOT_MAX_SCORE = 3
 
 
 # ── Gemini helpers ────────────────────────────────────────────────────────────
@@ -260,11 +262,11 @@ def generate_lot_narrative(stats: dict) -> dict:
     """
     data_parts = [f"Drug: {stats['drug_name']}"]
     if stats["final_lot_score"] is not None:
-        data_parts.append(f"Aggregate Final LOT Score: {stats['final_lot_score']} (out of {LOT_MAX_SCORE})")
+        data_parts.append(f"Aggregate Final LOT Score: {stats['final_lot_score']} (out of 5)")
 
     country_lines = []
     for c in stats["countries"]:
-        line = f"- {c['country']}: LOT Score {c['lot_score']}/{LOT_MAX_SCORE} ({c['lot_type'] or 'N/A'}), Confidence {c['confidence']}%"
+        line = f"- {c['country']}: LOT Score {c['lot_score']}/5 ({c['lot_type'] or 'N/A'}), Confidence {c['confidence']}%"
         if c["rationale"]:
             line += f" — Rationale: {c['rationale']}"
         country_lines.append(line)
@@ -294,7 +296,7 @@ Per-country breakdown:
 1. Start with a section: "Key Line of Treatment Findings for {stats['drug_name']}"
    - Summarize the most important observations about where this drug sits in treatment
      pathways across the countries analysed
-   - Include the aggregate final LOT score (e.g., "scored X out of 3 (the maximum LOT rank)") in simple terms
+   - Include the aggregate final LOT score (e.g., "scored X out of 5") in simple terms
      early in the findings — but do NOT explain how the score was derived or its weighting
    - Highlight:
      - Where the drug is positioned (first-line vs later-line) in the US versus other markets
@@ -329,7 +331,7 @@ Respond ONLY with a valid JSON object (no markdown fences, no extra text):
 {{
   "key_findings": {{
     "summary_bullets": [
-      "Key finding 1 — MUST state the aggregate final LOT score as X out of 3 (use the exact score from the data) and what it indicates in plain terms",
+      "Key finding 1 — MUST state the aggregate final LOT score as X out of 5 (use the exact score from the data) and what it indicates in plain terms",
       "Key finding 2 about US treatment-line positioning specifically",
       "Key finding 3 about positioning in other markets and any notable variation",
       "Key finding 4 about overall confidence in the classifications",
@@ -347,7 +349,7 @@ Respond ONLY with a valid JSON object (no markdown fences, no extra text):
   "profile_summary": {{
     "overall_assessment": "3-4 sentences providing a high-level summary of the drug's overall treatment-line positioning, written for a business audience",
     "cross_country_consistency": "1-2 sentences commenting on whether treatment-line positioning is consistent across countries",
-    "score_context": "1-2 sentences stating the aggregate final LOT score explicitly (e.g., 'The drug scored 2.3 out of 3 on the Line of Treatment scale, indicating...'). ALWAYS include the numeric score (X out of 3). Do NOT explain how the score was derived."
+    "score_context": "1-2 sentences stating the aggregate final LOT score explicitly (e.g., 'The drug scored 3.2 out of 5 on the Line of Treatment scale, indicating...'). ALWAYS include the numeric score (X out of 5). Do NOT explain how the score was derived."
   }}
 }}"""
 
@@ -360,7 +362,7 @@ Respond ONLY with a valid JSON object (no markdown fences, no extra text):
     return {
         "key_findings": {
             "summary_bullets": [
-                f"{stats['drug_name']} received an aggregate final LOT score of {stats['final_lot_score']} out of {LOT_MAX_SCORE}.",
+                f"{stats['drug_name']} received an aggregate final LOT score of {stats['final_lot_score']} out of 5.",
                 f"Countries analysed: {', '.join(c['country'] for c in stats['countries']) or 'N/A'}.",
             ],
             "geographic_variation_detail": "See country-by-country breakdown below.",
@@ -373,9 +375,9 @@ Respond ONLY with a valid JSON object (no markdown fences, no extra text):
             "strategic_recommendation": "See detailed analysis.",
         },
         "profile_summary": {
-            "overall_assessment": f"{stats['drug_name']} received an aggregate final LOT score of {stats['final_lot_score']} out of {LOT_MAX_SCORE}.",
+            "overall_assessment": f"{stats['drug_name']} received an aggregate final LOT score of {stats['final_lot_score']} out of 5.",
             "cross_country_consistency": "Consistency is based on available country-level classifications.",
-            "score_context": f"The drug scored {stats['final_lot_score']} out of {LOT_MAX_SCORE} on the Line of Treatment scale.",
+            "score_context": f"The drug scored {stats['final_lot_score']} out of 5 on the Line of Treatment scale.",
         },
     }
 
@@ -449,7 +451,7 @@ def _country_breakdown_table(countries: list[dict], styles: dict) -> Table:
     ]
     rows = [header]
     for c in countries:
-        score_display = f"{c['lot_score']}/{LOT_MAX_SCORE}" if c["lot_score"] is not None else "N/A"
+        score_display = f"{c['lot_score']}/5" if c["lot_score"] is not None else "N/A"
         confidence_display = f"{c['confidence']}%" if c["confidence"] is not None else "N/A"
         rows.append([
             Paragraph(c["country"], ParagraphStyle("CBCountry", parent=styles["cell"], alignment=TA_LEFT)),
@@ -479,6 +481,8 @@ def _country_breakdown_table(countries: list[dict], styles: dict) -> Table:
 def _scoring_framework_table(styles: dict) -> Table:
     """Render the LOT scoring reference table."""
     framework = [
+        ("5", LOT_SCORE_LABEL[5]),
+        ("4", LOT_SCORE_LABEL[4]),
         ("3", LOT_SCORE_LABEL[3]),
         ("2", LOT_SCORE_LABEL[2]),
         ("1", LOT_SCORE_LABEL[1]),
@@ -536,7 +540,7 @@ def build_single_drug_report(stats: dict, narrative: dict, output_path: str):
     story.append(Paragraph(report_title, styles["title"]))
     final_score_display = stats["final_lot_score"] if stats["final_lot_score"] is not None else "N/A"
     story.append(Paragraph(
-        f"Generated {datetime.now().strftime('%B %d, %Y')}  •  Final LOT Score: {final_score_display} / {LOT_MAX_SCORE}",
+        f"Generated {datetime.now().strftime('%B %d, %Y')}  •  Final LOT Score: {final_score_display} / 5",
         styles["subtitle"],
     ))
     story.append(HRFlowable(width="100%", thickness=2, color=DARK_BLUE, spaceAfter=12))
